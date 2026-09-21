@@ -6,6 +6,6 @@ I have had no prior experience with development of emu's (emulators) this is my 
 My goal is to make a functional PS1 EMU on the web made with Type Script, it is quite difficult and will take time.
 I have high hopes with this and hope to make the impossible, possible.
 It is in early development but is quite functional so far and I hope to make PS1 games close to playable!
-So far we pass all bios checks, reach splash, and render into the GUI.
+So far we pass all bios checks, reach splash, render into the GUI and some select PS1.exe test homebrew is functional.
 
 Thank you for reading :)
