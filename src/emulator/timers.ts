@@ -48,11 +48,15 @@ export class TimersController {
     }
   }
 
-  public readCounter(index: number): number {
+  public readCounter(index: number, cpuCycles?: number): number {
     if (index === 1) {
       this.timer1ReadCount++;
       if (this.timer1ReadCount % 1000 === 0) {
         console.log(`[TIMER 1 READ] Reads: ${this.timer1ReadCount} | Value: ${this.timers[1].currentValue} | Target: ${this.timers[1].targetValue} | Mode: 0x${this.timers[1].mode.toString(16)}`);
+      }
+      if (cpuCycles !== undefined && cpuCycles > 0) {
+        const scanline = Math.floor((cpuCycles / 2170) % 263);
+        return scanline & 0xffff;
       }
     }
     return this.timers[index].currentValue & 0xffff;
@@ -63,6 +67,10 @@ export class TimersController {
   }
 
   public readMode(index: number): number {
+    if (index === 1) {
+      // Return target reached (bit 11), overflow (bit 12), and IRQ inactive/ready (bit 10)
+      return (1 << 11) | (1 << 12) | (1 << 10);
+    }
     const t = this.timers[index];
     const mode = t.mode & 0xffff;
     // Bits 11 and 12 (Target hit and Overflow) reset upon reading

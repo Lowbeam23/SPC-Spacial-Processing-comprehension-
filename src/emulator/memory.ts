@@ -15,6 +15,8 @@ export type MemoryLogCallback = (level: 'warn' | 'error' | 'system' | 'bios' | '
 export interface CpuInterruptTarget {
   pc?: number;
   regs?: ArrayLike<number>;
+  cycles?: number;
+  instructionsExecuted?: number;
   clearInterruptPending(bit: number): void;
   setInterruptPending(bit: number): void;
 }
@@ -598,6 +600,13 @@ export class Memory {
     }
   }
 
+  public deliverVblankEvent(): void {
+    // DO NOT touch 0x80..0x90! That is executable code.
+    // Keep counter increments restricted strictly to 0x00000070.
+    const currentTicks = this.read32(0x00000070);
+    this.write32(0x00000070, (currentTicks + 1) >>> 0);
+  }
+
   public triggerInterrupt(bit: number): void {
     // GPU VBLANK sets Bit 0 in I_STAT (0x1F801070)
     this.iStat |= (1 << bit);
@@ -605,6 +614,7 @@ export class Memory {
 
     if (bit === 0) {
       this.vblankCount++;
+      this.deliverVblankEvent();
     }
   }
 
@@ -1285,10 +1295,14 @@ export class Memory {
         return this.timersCtrl.readMode(0);
       case 0x1f801108: // Timer 0 Target
         return this.timersCtrl.readTarget(0);
-      case 0x1f801110: // Timer 1 Counter
-        return this.timersCtrl.readCounter(1);
-      case 0x1f801114: // Timer 1 Mode
-        return this.timersCtrl.readMode(1);
+      case 0x1f801110: // Timer 1 Current Value (Root Counter 1)
+        {
+          const cycles = this.cpu ? (this.cpu.cycles || this.cpu.instructionsExecuted || 0) : this.timerTicks;
+          const scanline = Math.floor((cycles / 2170) % 263);
+          return scanline & 0xffff;
+        }
+      case 0x1f801114: // Timer 1 Mode / Status
+        return (1 << 11) | (1 << 12) | (1 << 10);
       case 0x1f801118: // Timer 1 Target
         return this.timersCtrl.readTarget(1);
       case 0x1f801120: // Timer 2 Counter
@@ -1308,8 +1322,19 @@ export class Memory {
         return this.gpuReadHandler ? this.gpuReadHandler() : 0;
       case 0x1f801814: // GP1 / GPUSTAT
         {
-          let stat = this.gpuStatHandler ? this.gpuStatHandler() : 0x1c802000;
-          return (stat | (1 << 26) | (1 << 27) | (1 << 28)) >>> 0;
+          const cycles = this.cpu ? (this.cpu.cycles || this.cpu.instructionsExecuted || 0) : this.timerTicks;
+          let stat = this.gpu ? this.gpu.readStat(cycles) : (this.gpuStatHandler ? this.gpuStatHandler() : 0x14002000);
+          stat |= (1 << 26); // Ready to receive DMA block
+          stat |= (1 << 27); // Ready to send VRAM to CPU
+          stat |= (1 << 28); // Ready to receive command word / GPU idle
+
+          const isOddField = (Math.floor(cycles / 564480) & 1) !== 0;
+          if (isOddField) {
+            stat |= (1 << 31);
+          } else {
+            stat &= ~(1 << 31);
+          }
+          return stat >>> 0;
         }
       case 0x1f801824: // MDEC Status
         return 0x00000000;
@@ -1485,8 +1510,13 @@ export class Memory {
       case 0x1f801100: return this.timersCtrl.readCounter(0);
       case 0x1f801104: return this.timersCtrl.readMode(0);
       case 0x1f801108: return this.timersCtrl.readTarget(0);
-      case 0x1f801110: return this.timersCtrl.readCounter(1);
-      case 0x1f801114: return this.timersCtrl.readMode(1);
+      case 0x1f801110:
+        {
+          const cycles = this.cpu ? (this.cpu.cycles || this.cpu.instructionsExecuted || 0) : this.timerTicks;
+          const scanline = Math.floor((cycles / 2170) % 263);
+          return scanline & 0xffff;
+        }
+      case 0x1f801114: return (1 << 11) | (1 << 12) | (1 << 10);
       case 0x1f801118: return this.timersCtrl.readTarget(1);
       case 0x1f801120: return this.timersCtrl.readCounter(2);
       case 0x1f801124: return this.timersCtrl.readMode(2);

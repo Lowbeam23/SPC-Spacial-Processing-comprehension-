@@ -477,6 +477,8 @@ export class Cpu {
       case 0x2a: // SWL
       case 0x2b: // SW
       case 0x2e: // SWR
+      case 0x32: // LWC2
+      case 0x38: // SWC2
         return 3;
 
       // ALU operations with immediate (1-2 cycles)
@@ -552,6 +554,37 @@ export class Cpu {
 
     const currentPc = this.pc;
     this.memory.currentCpuPc = currentPc;
+
+    // Direct BIOS A0/B0/C0 vector dispatch if RAM jump tables are empty
+    if (physicalPc === 0xa0 || physicalPc === 0xb0 || physicalPc === 0xc0) {
+      const opcAtVector = this.memory.read32(currentPc);
+      if (opcAtVector === 0 || opcAtVector === 0xffffffff) {
+        const funcNum = (physicalPc === 0xc0) ? this.regs[4] : (this.regs[9] || this.regs[4]);
+        this.regs[2] = 1; // Default success return in $v0
+
+        if (physicalPc === 0xb0 && funcNum === 0x08) {
+          this.regs[2] = 0xf0000001; // Event descriptor
+        } else if (physicalPc === 0xa0 && funcNum === 0x39) {
+          this.regs[2] = 0; // InitGeom returns 0
+        }
+
+        const returnRa = this.regs[31] >>> 0;
+        if (returnRa !== 0) {
+          if (this.memory.onLog) {
+            this.memory.onLog('bios', `[BIOS VECTOR 0x${physicalPc.toString(16).toUpperCase()}] Handled vector fn 0x${funcNum.toString(16)} -> JR $ra (0x${returnRa.toString(16).toUpperCase()}), $v0=0x${this.regs[2].toString(16)}`, currentPc);
+          }
+          this.pc = returnRa;
+          this.nextPc = (returnRa + 4) >>> 0;
+          this.inDelaySlot = false;
+          this.branchPending = false;
+          return 4;
+        } else {
+          this.reportError(`[BIOS VECTOR TRAP] Fetched from vector 0x${physicalPc.toString(16).toUpperCase()} with $ra=0x0`, currentPc);
+          this.halted = true;
+          return 4;
+        }
+      }
+    }
 
     if (currentPc === 0x80069570 || currentPc === 0x80069574) {
       const opc = this.memory.read32(currentPc);
@@ -1112,7 +1145,7 @@ export class Cpu {
         }
         break;
 
-      case 0x32: { // LWC2 rt, offset(rs)
+      case 0x32: { // LWC2 rt, offset(rs) - Load Word Coprocessor 2 (GTE)
         const instr = opcode;
         const rs = (instr >> 21) & 0x1F;
         const rt = (instr >> 16) & 0x1F; // GTE register index (0-31)
@@ -1123,6 +1156,10 @@ export class Cpu {
           this.gte.writeDataRegister(rt, val);
         }
         break;
+      }
+
+      case 0x33: { // LWC3 load stub
+        break; // Non-fatal NOP
       }
 
       case 0x36:
@@ -1141,10 +1178,6 @@ export class Cpu {
         break;
       }
 
-      case 0x33: { // LWC3 load stub
-        break; // Non-fatal NOP
-      }
-
       case 0x37: // LD (Load Doubleword) - Fallback to 32-bit LW
         {
           const base = (opcode >>> 21) & 0x1f;
@@ -1157,6 +1190,17 @@ export class Cpu {
           }
         }
         break;
+
+      case 0x38: { // SWC2 rt, offset(rs) - Store Word Coprocessor 2 (GTE)
+        const instr = opcode;
+        const rs = (instr >> 21) & 0x1F;
+        const rt = (instr >> 16) & 0x1F; // GTE register index (0-31)
+        const imm = (instr << 16) >> 16; // Sign-extend 16-bit offset
+        const addr = (this.regs[rs] + imm) >>> 0;
+        const val = this.gte ? this.gte.readDataRegister(rt) : 0;
+        this.memory.write32(addr, val);
+        break;
+      }
 
       case 0x3b: { // SWC3 / COP3 store or GTE macro alias
         const instr = opcode;
@@ -1235,9 +1279,19 @@ export class Cpu {
         this.regs[rd] = (((this.regs[rt] | 0) >> (this.regs[rs] & 0x1f))) >>> 0;
         break;
       case 0x08: // JR
+        if (this.regs[rs] === 0) {
+          this.reportError(`[NULL DEREFERENCE] Attempted JR to 0x0 from $r${rs}. $ra=0x${this.regs[31].toString(16)}, $t9=0x${this.regs[25].toString(16)}, $k0=0x${this.regs[26].toString(16)}, $k1=0x${this.regs[27].toString(16)}`, currentPc);
+          this.halted = true;
+          return;
+        }
         this.triggerBranch(this.regs[rs] >>> 0);
         break;
       case 0x09: // JALR
+        if (this.regs[rs] === 0) {
+          this.reportError(`[NULL DEREFERENCE] Attempted JALR to 0x0 from $r${rs}. $ra=0x${this.regs[31].toString(16)}, $t9=0x${this.regs[25].toString(16)}, $k0=0x${this.regs[26].toString(16)}, $k1=0x${this.regs[27].toString(16)}`, currentPc);
+          this.halted = true;
+          return;
+        }
         this.regs[rd] = (currentPc + 8) >>> 0;
         this.triggerBranch(this.regs[rs] >>> 0);
         break;
@@ -1263,90 +1317,29 @@ export class Cpu {
           // Trigger trace for next 20 instructions around stall/syscall
           this.postSyscallTraceRemaining = 20;
 
-          // Check if this is a BIOS syscall dispatcher / kernel vector call
-          // (e.g. at 0xA004E45C / physical 0x0004E45C with $ra: 0xE10 for Event/Thread management,
-          // or standard MIPS syscalls: EnterCriticalSection, ExitCriticalSection, ChangeThread)
-          const maskedPc = (currentPc & 0x1fffffff) >>> 0;
-          const isBiosSyscallDispatcher =
-            maskedPc === 0x0004e45c ||
-            currentPc === 0xa004e45c ||
-            ra === 0x0e10 ||
-            (ra >= 0x00000b00 && ra <= 0x00001200);
-
           const bev = (this.cop0Regs[12] & (1 << 22)) !== 0;
           const targetVector = bev ? 0xbfc00180 : 0x80000080;
           const vectorFirstInstr = this.memory.read32(targetVector);
           const hasInstalledVector = vectorFirstInstr !== 0 && vectorFirstInstr !== 0xffffffff;
 
-          if (isBiosSyscallDispatcher || !hasInstalledVector || a0 === 1 || a0 === 2 || a0 === 3) {
-            // Clean return from syscall dispatcher
+          if (!hasInstalledVector) {
+            // Clean HLE fallback when running without installed kernel exception vector
             if (a0 === 1) {
-              // EnterCriticalSection: disable interrupts, return previous SR in $v0
-              const oldSr = this.cop0Regs[12];
+              // EnterCriticalSection: disable interrupts, return 1 in $v0
               this.cop0Regs[12] &= ~1;
-              this.regs[2] = (oldSr & 1);
+              this.regs[2] = 1;
             } else if (a0 === 2) {
-              // ExitCriticalSection: enable interrupts
+              // ExitCriticalSection: enable interrupts, return 1 in $v0
               this.cop0Regs[12] |= 1;
               this.regs[2] = 1;
-
-              // Check if this is actually a TestEvent/CheckEvent event polling syscall
-              if (a3 === 0x2a) {
-                let resolvedEvAddr = 0;
-                const a1_masked = a1 & 0x1fffff;
-                if (a1_masked >= 0x80 && a1_masked < 0x200000 - 24) {
-                  resolvedEvAddr = a1_masked;
-                }
-                const eventTablePtr = this.memory.read32(0x00000080) & 0x1fffff;
-                if (!resolvedEvAddr && eventTablePtr >= 0x80 && eventTablePtr < 0x200000 - 24) {
-                  if (a1 >= 0 && a1 < 32) {
-                    // Try 32-byte stride first
-                    resolvedEvAddr = eventTablePtr + a1 * 32;
-                    if (this.memory.read32(resolvedEvAddr) === 0) {
-                      resolvedEvAddr = eventTablePtr + a1 * 20;
-                    }
-                  } else {
-                    // Scan the event table for a matching event using both strides
-                    for (let i = 0; i < 32; i++) {
-                      const addr32 = eventTablePtr + i * 32;
-                      if (addr32 < 0x200000 - 24 && this.memory.read32(addr32) === a1) {
-                        resolvedEvAddr = addr32;
-                        break;
-                      }
-                      const addr20 = eventTablePtr + i * 20;
-                      if (addr20 < 0x200000 - 24 && this.memory.read32(addr20) === a1) {
-                        resolvedEvAddr = addr20;
-                        break;
-                      }
-                    }
-                  }
-                }
-
-                if (resolvedEvAddr) {
-                  const evClass = this.memory.read32(resolvedEvAddr);
-                  const isCdrom = (evClass === 0xF0000003) || (evClass === 0xF4000003) || ((evClass & 0xFF) === 3);
-                  const isTimer = (evClass === 0xF0000001) || (evClass === 0xF4000001) || ((evClass & 0xFF) === 1);
-                  if (isCdrom || isTimer) {
-                    this.regs[2] = 1; // Return 1 in $v0
-                    this.memory.write32(resolvedEvAddr + 4, 0); // Mark status as processed (status = 0)
-                    console.log(`[SYSCALL 0x2A] TestEvent matched ${isCdrom ? 'CD-ROM' : 'Timer'} event at 0x${resolvedEvAddr.toString(16)}. Returning 1 and status=0.`);
-                  }
-                }
-              }
             } else if (a0 === 3) {
               // ChangeThreadSubFunction
               this.regs[2] = 0;
             } else {
-              // Event / Thread management syscall at 0xA004E45C / 0xE10
-              this.regs[2] = 1; // Return success in $v0
+              this.regs[2] = 1;
             }
 
-            // Restore / preserve $ra so return cleanly reaches caller
-            if (ra === 0x0e10) {
-              this.regs[31] = 0x0e10;
-            }
-
-            // Advance PC past the SYSCALL instruction (PC = EPC + 4) so it does not loop
+            // Advance PC past the SYSCALL instruction
             this.epc = currentPc >>> 0;
             this.cop0Regs[14] = (currentPc + 4) >>> 0;
             this.pc = (currentPc + 4) >>> 0;
@@ -1354,14 +1347,6 @@ export class Cpu {
             this.inDelaySlot = false;
             this.branchPending = false;
             this.exceptionTriggeredInStep = true;
-
-            if (this.memory.onLog) {
-              this.memory.onLog(
-                'bios',
-                `[BIOS SYSCALL DISPATCHER] Clean return from syscall at 0x${currentPc.toString(16).toUpperCase()} (EPC: 0x${this.epc.toString(16).toUpperCase()}, $ra: 0x${this.regs[31].toString(16).toUpperCase()}, $a0: 0x${a0.toString(16)}, $v0: 0x${this.regs[2].toString(16)}) -> resumed at PC: 0x${this.pc.toString(16).toUpperCase()}`,
-                currentPc
-              );
-            }
             break;
           }
 
@@ -1369,7 +1354,25 @@ export class Cpu {
           break;
         }
       case 0x0d: // BREAK
-        this.triggerException(9, currentPc, wasDelaySlot);
+        {
+          const bev = (this.cop0Regs[12] & (1 << 22)) !== 0;
+          const targetVector = bev ? 0xbfc00180 : 0x80000080;
+          const vectorFirstInstr = this.memory.read32(targetVector);
+          const hasInstalledVector = vectorFirstInstr !== 0 && vectorFirstInstr !== 0xffffffff;
+
+          if (!hasInstalledVector) {
+            if (this.memory.onLog) {
+              this.memory.onLog('warn', `[MIPS BREAK] Handled BREAK opcode at PC: 0x${currentPc.toString(16).toUpperCase()} - skipping to next instruction`, currentPc);
+            }
+            this.pc = (currentPc + 4) >>> 0;
+            this.nextPc = (this.pc + 4) >>> 0;
+            this.inDelaySlot = false;
+            this.branchPending = false;
+            this.exceptionTriggeredInStep = true;
+          } else {
+            this.triggerException(9, currentPc, wasDelaySlot);
+          }
+        }
         break;
       case 0x10: // MFHI
         this.regs[rd] = this.hi >>> 0;
@@ -1467,7 +1470,14 @@ export class Cpu {
         this.regs[rd] = (this.regs[rs] >>> 0 < this.regs[rt] >>> 0) ? 1 : 0;
         break;
       case 0x30:
+      case 0x38:
+      case 0x39:
+      case 0x3a: // funct 0x3a (unassigned MIPS I slot / 64-bit DSRA) - clean non-fatal NOP
+      case 0x3b:
+      case 0x3c:
       case 0x3d:
+      case 0x3e:
+      case 0x3f:
         // Silent NOPs to allow clean pipeline execution
         break;
       default: {

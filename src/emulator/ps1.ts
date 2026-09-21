@@ -124,6 +124,7 @@ export class Ps1Emulator {
     this.memory.gpuWriteHandler = (val) => this.gpu.sendGp0(val);
     this.memory.gpuGp1Handler = (val) => this.gpu.writeGp1(val);
     this.memory.gpuBatchHandler = (words) => this.gpu.processDmaBatch(words);
+    this.memory.onFlushCycles = (cycles) => this.advanceCycles(cycles);
 
     // Hook logs from memory & GPU
     this.memory.onLog = (level, message, addr) => {
@@ -476,24 +477,17 @@ export class Ps1Emulator {
    */
   public checkExecutableLaunch(): void {
     if (this.hasLoggedExecutableLaunch) return;
+    if (!this.cdrom.hasDisc) return; // Clean No-Disc state: allow BIOS GUI / Audio CD / Memory Card manager to execute
 
     const pc = this.cpu.pc >>> 0;
     // PSX game executable code space is 0x80010000..0x8002FFFF or user RAM >= 0x80010000 outside BIOS ROM (0xBFC00000)
-    const isExeSpace = (pc >= 0x80010000 && pc <= 0x8002FFFF) ||
-      (this.memory.dma?.dma3TransferCount > 0 && pc >= 0x80010000 && pc < 0xBFC00000) ||
-      (this.cdrom.exeHeader && pc === this.cdrom.exeHeader.initial_pc);
+    const isExeSpace = (this.cdrom.exeHeader && pc === this.cdrom.exeHeader.initial_pc) ||
+      (this.memory.dma?.dma3TransferCount > 0 && pc >= 0x80010000 && pc < 0xBFC00000);
 
     if (isExeSpace) {
       this.hasLoggedExecutableLaunch = true;
       this.postLaunchCycles = 0;
       this.lastPostLaunchLogCycle = 0;
-
-      const exeName = this.cdrom.discInfo?.executableName || 'PSX.EXE';
-      const pcHex = `0x${pc.toString(16).padStart(8, '0').toUpperCase()}`;
-      const logMsg = `[EXECUTABLE LAUNCH] Jumping to ${exeName} at PC: ${pcHex}`;
-      console.log(logMsg);
-      this.addLog('system', logMsg, pc);
-      this.recordRelevantEvent('EXECUTABLE', logMsg);
 
       // Parse 2048-byte header from disc or RAM:
       // initial_pc: offset 0x10 (4 bytes)
@@ -511,13 +505,15 @@ export class Ps1Emulator {
       const initial_gp = (exeHeader ? exeHeader.initial_gp : 0) >>> 0;
       const load_addr = (exeHeader ? exeHeader.load_addr : pc) >>> 0;
       const load_size = (exeHeader ? exeHeader.load_size : 0) >>> 0;
-      const initial_sp_base = (exeHeader ? exeHeader.initial_sp_base : 0x801FFFF0) >>> 0;
-      const initial_sp_offset = (exeHeader ? exeHeader.initial_sp_offset : 0) >>> 0;
+      const rawSp = (exeHeader ? (exeHeader.initial_sp_base + exeHeader.initial_sp_offset) : 0) >>> 0;
+      const sp = rawSp !== 0 ? rawSp : 0x801FFFF0;
 
-      let sp = (initial_sp_base + initial_sp_offset) >>> 0;
-      if (sp === 0) {
-        sp = 0x801FFFF0;
-      }
+      const exeName = this.cdrom.discInfo?.executableName || 'PSX.EXE';
+      const targetPcHex = `0x${initial_pc.toString(16).padStart(8, '0').toUpperCase()}`;
+      const logMsg = `[EXECUTABLE LAUNCH] Jumping to ${exeName} at PC: ${targetPcHex}`;
+      console.log(logMsg);
+      this.addLog('system', logMsg, initial_pc);
+      this.recordRelevantEvent('EXECUTABLE', logMsg);
 
       // If executable payload is available from disc, ensure destination RAM is populated
       if (this.cdrom) {
@@ -545,6 +541,7 @@ export class Ps1Emulator {
 
       // Initialize CPU Registers Before Jumping:
       // Set CPU.pc = initial_pc;
+      // Set CPU.nextPc = (initial_pc + 4) >>> 0;
       // If initial_gp !== 0, set CPU.regs[28] = initial_gp;
       // Set CPU.regs[29] = initial_sp_base + initial_sp_offset; (If 0, default to 0x801FFFF0).
       // Set CPU.regs[30] = CPU.regs[29]; (Frame pointer $fp).
@@ -554,7 +551,9 @@ export class Ps1Emulator {
       this.cpu.branchPending = false;
       this.cpu.halted = false;
 
-      this.cpu.regs[28] = initial_gp !== 0 ? initial_gp : 0x80070000;
+      if (initial_gp !== 0) {
+        this.cpu.regs[28] = initial_gp;
+      }
       this.cpu.regs[29] = sp;
       this.cpu.regs[30] = sp; // Frame pointer $fp
 
@@ -563,7 +562,7 @@ export class Ps1Emulator {
 
       // Log the parsed EXE header values when jumping:
       // [EXE HEADER] PC: 0x..., SP: 0x..., GP: 0x..., LoadAddr: 0x..., Size: ... bytes
-      const headerPcHex = `0x${initial_pc.toString(16).padStart(8, '0').toUpperCase()}`;
+      const headerPcHex = targetPcHex;
       const spHex = `0x${sp.toString(16).padStart(8, '0').toUpperCase()}`;
       const gpHex = `0x${initial_gp.toString(16).padStart(8, '0').toUpperCase()}`;
       const loadAddrHex = `0x${load_addr.toString(16).padStart(8, '0').toUpperCase()}`;
@@ -640,7 +639,6 @@ export class Ps1Emulator {
 
     const output = lines.join('\n');
     console.log(output);
-    this.gpu.blitCheckLoggedCount = 0;
 
     this.addLog('system', `Status Dump: PC=${pcHex} | VRAM Pixels: ${hasPixels ? `YES (${totalVramNonZero.toLocaleString()})` : 'NO'} | Display: ${displayPixelsExist ? `${displayNonZero.toLocaleString()} px` : '0 px'} | Last Event: ${events.length > 0 ? events[events.length - 1].message : 'None'}`);
 
@@ -724,6 +722,12 @@ export class Ps1Emulator {
     const scanline = Math.floor((this.vblankCycleCounter * 263) / Ps1Emulator.NTSC_VBLANK_CYCLES) % 263;
     this.gpu.currentScanline = scanline;
     this.gpu.vblank = scanline >= 240;
+
+    // Periodically assert VBlank IRQ 0 and deliver event 0xF0000001 when frame completes / scanline wraps
+    if (this.vblankCycleCounter >= Ps1Emulator.NTSC_VBLANK_CYCLES) {
+      this.memory.triggerInterrupt(0);
+      this.cpu.checkInterrupts();
+    }
   }
 
   public step(): void {
@@ -823,7 +827,10 @@ export class Ps1Emulator {
       this.cpu.checkInterrupts();
     }
 
+    this.vblankCycleCounter += executed;
+    this.totalCycles += executed;
     this.memory.flushCycles();
+    this.checkExecutableLaunch();
 
     if (this.vblankCycleCounter >= Ps1Emulator.NTSC_VBLANK_CYCLES) {
       // 1. Set Bit 0 of I_STAT (0x1F801070 |= 0x01) and update interrupts
