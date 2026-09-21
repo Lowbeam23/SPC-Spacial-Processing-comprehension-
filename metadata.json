@@ -1,0 +1,6 @@
+{
+  "name": "SPC",
+  "description": "Spatial Processing Comprehension (SPC) - Streamlined PlayStation 1 MIPS R3000A emulator with dynamic recompiler, BIOS runner, and clean hardware control interface.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
