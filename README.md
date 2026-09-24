@@ -9,3 +9,6 @@ It is in early development but is quite functional so far and I hope to make PS1
 So far we pass all bios checks, reach splash, render into the GUI and some select PS1.exe test homebrew is functional.
 
 Thank you for reading :)
+
+Well SPC will be left as to help other devs who may wanna make something like me but I will leave it here, running commercial games is incredibly difficult.
+I would like to work on what I love and that is game and more simple software but im more than proud enough to see it make to the GUI and booting select games even if not fully working.
