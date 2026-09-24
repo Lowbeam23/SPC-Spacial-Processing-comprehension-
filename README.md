@@ -11,4 +11,4 @@ So far we pass all bios checks, reach splash, render into the GUI and some selec
 Thank you for reading :)
 
 Well SPC will be left as to help other devs who may wanna make something like me but I will leave it here, running commercial games is incredibly difficult.
-I would like to work on what I love and that is games and more simple software but im more than proud enough to see it make to the GUI and booting select games even if not fully working.
+I would like to work on what I love and that is games and more simple software but im more than proud enough to see it make through to the GUI and booting select games even if not fully working.
