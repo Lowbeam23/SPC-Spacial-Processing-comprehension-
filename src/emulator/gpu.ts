@@ -34,10 +34,7 @@ export function signExtend11(val: number): number {
 }
 
 export function getGp0PacketLength(commandWord: number): number {
-  let opcode = (commandWord >>> 24) & 0xff;
-  if (opcode === 0 && (commandWord & 0xff) !== 0) {
-    opcode = commandWord & 0xff;
-  }
+  const opcode = (commandWord >>> 24) & 0xff;
 
   if (opcode >= 0xe1 && opcode <= 0xe6) return 1;
   if (opcode === 0x02) return 3;
@@ -99,6 +96,12 @@ export class Gpu {
   }
 
   public get height(): number {
+    const stat = this.gpuStat;
+    const vres = (stat >>> 19) & 0x01;
+    const isPal = (stat >>> 20) & 0x01;
+    const isInterlaced = (stat >>> 22) & 0x01;
+    if (vres === 1 && isInterlaced === 1) return 480;
+    if (isPal === 1) return 256;
     return this._height || 240;
   }
 
@@ -118,6 +121,9 @@ export class Gpu {
   public set displayHeight(val: number) {
     this.height = val;
   }
+
+  public maskSet: boolean = false;
+  public maskCheck: boolean = false;
 
   public vram: Uint16Array = new Uint16Array(1024 * 512);
   public vram32: Uint32Array = new Uint32Array(this.vram.buffer);
@@ -192,6 +198,13 @@ export class Gpu {
   public gp0Buffer: number[] = [];
   public currentGp0Cmd: number = 0;
 
+  public imgBuffer: Uint16Array = new Uint16Array(1024 * 512);
+  public imgIndex: number = 0;
+
+  public imgReadBuffer: Uint16Array = new Uint16Array(1024 * 512);
+  public imgReadIndex: number = 0;
+  public imgReadTotal: number = 0;
+
   public transferDstX: number = 0;
   public transferDstY: number = 0;
   public transferWidth: number = 0;
@@ -212,11 +225,20 @@ export class Gpu {
   public onLog?: (type: 'gpu' | 'warn' | 'error', msg: string) => void;
   public onBootBenchmark?: () => void;
   public onScreenChange?: (message: string) => void;
+  public onTriggerIrq?: () => void;
+  public onAcknowledgeIrq?: () => void;
 
   public hasBootBenchmarked: boolean = false;
   public totalDrawPacketsProcessed: number = 0;
   public totalGpuDrawMs: number = 0;
   public totalBlitMs: number = 0;
+
+  public gp0WriteCount: number = 0;
+  public gp1WriteCount: number = 0;
+  public dma2PacketCount: number = 0;
+  public vblankIrqCount: number = 0;
+  private _lastLoggedGp0Cmd: number = -1;
+  private _lastLoggedGp1Cmd: number = -1;
 
   constructor() {
     this.reset();
@@ -237,7 +259,10 @@ export class Gpu {
     this.drawOffsetX = 0;
     this.drawOffsetY = 0;
     this.drawMode = 0;
+    this.currentTexpage = 0;
     this.textureWindow = 0;
+    this.maskSet = false;
+    this.maskCheck = false;
     this.displayDisabled = false;
     this.displayEnabled = true;
     this.vblank = false;
@@ -250,17 +275,41 @@ export class Gpu {
     this.gp0Buffer = [];
     this.transferWordsRemaining = 0;
     this.totalDrawPacketsProcessed = 0;
+    this.gp0WriteCount = 0;
+    this.gp1WriteCount = 0;
+    this.dma2PacketCount = 0;
+    this.vblankIrqCount = 0;
   }
 
-  public endDmaPacket(): void {}
+  public endDmaPacket(): void {
+    this.dma2PacketCount++;
+    if (this.gp0Buffer.length > 0) {
+      const cmd = (this.gp0Buffer[0] >>> 24) & 0xff;
+      if ((cmd >= 0x48 && cmd <= 0x4f) || (cmd >= 0x58 && cmd <= 0x5f)) {
+        this.executeGp0Packet(this.gp0Buffer);
+      } else {
+        const totalWords = getGp0PacketLength(this.gp0Buffer[0]);
+        if (this.gp0Buffer.length >= totalWords) {
+          this.executeGp0Packet(this.gp0Buffer.slice(0, totalWords));
+        }
+      }
+      this.gp0Buffer = [];
+      this.currentGp0Cmd = 0;
+    }
+  }
 
   public onVBlank(): void {
+    this.vblankIrqCount++;
     this.extractFrame();
     this.frameReady = true;
+    if (this.onFrame) {
+      this.onFrame();
+    }
   }
 
   public getState(): GpuState {
     const statusVal = this.readStat();
+    const first16 = Array.from(this.vram.subarray(0, 16)).map(v => '0x' + (v & 0xffff).toString(16).padStart(4, '0')).join(' ');
     return {
       status: statusVal,
       displayMode: `${this.width}x${this.height} ${this.is24BitColor ? '24bpp' : '15bpp'}`,
@@ -270,10 +319,28 @@ export class Gpu {
       framesRendered: this.framesRendered,
       readyForCommands: (statusVal & (1 << 26)) !== 0,
       readyForDma: (statusVal & (1 << 28)) !== 0,
+      gp0WriteCount: this.gp0WriteCount,
+      gp1WriteCount: this.gp1WriteCount,
+      dma2PacketCount: this.dma2PacketCount,
+      vblankIrqCount: this.vblankIrqCount,
+      totalVramNonZero: this.getTotalVramNonZeroCount(),
+      displayNonZero: this.getDisplayNonZeroCount(),
+      displayStartX: this.displayStartX,
+      displayStartY: this.displayStartY,
+      displayDisabled: this.displayDisabled,
+      vramFirst16WordsHex: first16,
     };
   }
 
   public readGpu(): number {
+    if (this.imgReadIndex < this.imgReadTotal) {
+      const p0 = this.imgReadBuffer[this.imgReadIndex++];
+      const p1 = (this.imgReadIndex < this.imgReadTotal) ? this.imgReadBuffer[this.imgReadIndex++] : 0;
+      if (this.imgReadIndex >= this.imgReadTotal) {
+        this.gpuStat &= ~(1 << 27);
+      }
+      return ((p1 << 16) | (p0 & 0xffff)) >>> 0;
+    }
     if (this.readWordsRemaining > 0) {
       const p1 = this.vram[((this.readDstY + this.readCurY) & 511) * 1024 + ((this.readDstX + this.readCurX) & 1023)] & 0xffff;
       this.readCurX++;
@@ -288,6 +355,9 @@ export class Gpu {
         this.readCurY++;
       }
       this.readWordsRemaining--;
+      if (this.readWordsRemaining <= 0) {
+        this.gpuStat &= ~(1 << 27);
+      }
       return ((p2 << 16) | p1) >>> 0;
     }
     return this.gpuReadValue;
@@ -296,18 +366,20 @@ export class Gpu {
   public readStat(cpuCycles?: number): number {
     let stat = this.gpuStat;
     stat |= (1 << 26); // Ready to receive DMA block
-    stat |= (1 << 27); // Ready to send VRAM to CPU
-    stat |= (1 << 28); // Ready to receive command word / GPU idle
+
+    if (this.transferWordsRemaining > 0) {
+      stat &= ~(1 << 28); // Busy receiving image data
+    } else {
+      stat |= (1 << 28);  // Ready for command word
+    }
 
     const isOddField = (cpuCycles !== undefined && cpuCycles > 0)
       ? (Math.floor(cpuCycles / 564480) & 1) !== 0
       : this.currentField === 1;
 
     if (isOddField) {
-      stat |= (1 << 19);
       stat |= (1 << 31);
     } else {
-      stat &= ~(1 << 19);
       stat &= ~(1 << 31);
     }
 
@@ -326,11 +398,14 @@ export class Gpu {
 
   public sendGp0(data: number): void {
     const val = data >>> 0;
+    this.gp0WriteCount++;
 
     if (this.transferWordsRemaining > 0) {
       this.writeCpuToVramWord(val);
       this.transferWordsRemaining--;
-      if (this.transferWordsRemaining === 0) {
+
+      if (this.transferWordsRemaining <= 0) {
+        this.gpuStat |= (1 << 28); // GPU ready for commands
         this.framesRendered++;
       }
       return;
@@ -338,23 +413,54 @@ export class Gpu {
 
     if (this.gp0Buffer.length === 0) {
       this.currentGp0Cmd = (val >>> 24) & 0xFF;
+      if (this.onLog && this.currentGp0Cmd !== this._lastLoggedGp0Cmd) {
+        this._lastLoggedGp0Cmd = this.currentGp0Cmd;
+        let cmdDesc = `0x${this.currentGp0Cmd.toString(16).padStart(2, '0').toUpperCase()}`;
+        if (this.currentGp0Cmd === 0x01) cmdDesc += ' (Clear Cache)';
+        else if (this.currentGp0Cmd === 0x02) cmdDesc += ' (Fill VRAM Rectangle)';
+        else if (this.currentGp0Cmd >= 0x20 && this.currentGp0Cmd <= 0x3f) cmdDesc += ' (Render Polygon)';
+        else if (this.currentGp0Cmd >= 0x60 && this.currentGp0Cmd <= 0x7f) cmdDesc += ' (Render Rectangle / Sprite)';
+        else if (this.currentGp0Cmd >= 0xa0 && this.currentGp0Cmd <= 0xbf) cmdDesc += ' (CPU-to-VRAM Transfer)';
+        else if (this.currentGp0Cmd >= 0xe1 && this.currentGp0Cmd <= 0xe6) cmdDesc += ' (Environment / Draw Settings)';
+        this.onLog('gpu', `[GPU GP0 WRITE 0x1F801810] Command: ${cmdDesc} (Val: 0x${val.toString(16).toUpperCase()})`);
+      }
     }
     this.gp0Buffer.push(val);
 
     if (this.currentGp0Cmd >= 0xA0 && this.currentGp0Cmd <= 0xBF) {
       if (this.gp0Buffer.length === 3) {
-        const dst = this.gp0Buffer[1];
-        const size = this.gp0Buffer[2];
-        const width = size & 0xFFFF;
-        const height = (size >>> 16) & 0xFFFF;
+        const rawDst = this.gp0Buffer[1];
+        const rawSize = this.gp0Buffer[2];
 
-        this.transferDstX = dst & 0x3FF;
-        this.transferDstY = (dst >>> 16) & 0x1FF;
-        this.transferWidth = width;
-        this.transferHeight = height;
+        const x = rawDst & 0xFFFF;
+        const y = (rawDst >>> 16) & 0xFFFF;
+        const w = rawSize & 0xFFFF;
+        const h = (rawSize >>> 16) & 0xFFFF;
+
+        // Reject invalid zero-size transfers (e.g., rawSize === 0)
+        if (w === 0 && h === 0) {
+          this.transferWordsRemaining = 0;
+          this.gp0Buffer = [];
+          this.currentGp0Cmd = 0;
+          return;
+        }
+
+        this.transferDstX = x & 0x3FF;
+        this.transferDstY = y & 0x1FF;
+        this.transferWidth = ((w - 1) & 0x3FF) + 1;
+        this.transferHeight = ((h - 1) & 0x1FF) + 1;
         this.transferCurX = 0;
         this.transferCurY = 0;
-        this.transferWordsRemaining = ((width * height) + 1) >>> 1;
+        this.imgIndex = 0;
+
+        const totalPixels = this.transferWidth * this.transferHeight;
+        this.transferWordsRemaining = (totalPixels + 1) >>> 1;
+
+        const msg = `[VRAM IMAGE LOAD] Corrected Dst: (${this.transferDstX}, ${this.transferDstY}), Size: ${this.transferWidth}x${this.transferHeight} (${this.transferWordsRemaining} words)`;
+        console.log(msg);
+        if (this.onLog) {
+          this.onLog('gpu', msg);
+        }
 
         this.gp0Buffer = [];
       }
@@ -363,19 +469,38 @@ export class Gpu {
 
     if (this.currentGp0Cmd >= 0xC0 && this.currentGp0Cmd <= 0xDF) {
       if (this.gp0Buffer.length === 3) {
-        const src = this.gp0Buffer[1];
-        const size = this.gp0Buffer[2];
-        const width = size & 0xFFFF;
-        const height = (size >>> 16) & 0xFFFF;
+        const rawSrc = this.gp0Buffer[1];
+        const rawSize = this.gp0Buffer[2];
 
-        this.readDstX = src & 0x3FF;
-        this.readDstY = (src >>> 16) & 0x1FF;
-        this.readWidth = width;
-        this.readHeight = height;
-        this.readCurX = 0;
-        this.readCurY = 0;
-        this.readWordsRemaining = ((width * height) + 1) >>> 1;
+        const sx = rawSrc & 0xFFFF;
+        const sy = (rawSrc >>> 16) & 0xFFFF;
+        const w = rawSize & 0xFFFF;
+        const h = (rawSize >>> 16) & 0xFFFF;
 
+        this.readDstX = sx & 0x3FF;
+        this.readDstY = sy & 0x1FF;
+        this.readWidth = ((w - 1) & 0x3FF) + 1;
+        this.readHeight = ((h - 1) & 0x1FF) + 1;
+
+        const totalPixels = this.readWidth * this.readHeight;
+        this.imgReadTotal = totalPixels;
+        this.imgReadIndex = 0;
+        this.readWordsRemaining = (totalPixels + 1) >>> 1;
+
+        // Extract halfwords line-by-line from VRAM into the read buffer
+        if (!this.imgReadBuffer || this.imgReadBuffer.length < totalPixels) {
+          this.imgReadBuffer = new Uint16Array(totalPixels + 2);
+        }
+        let bufferIdx = 0;
+        for (let y = 0; y < this.readHeight; y++) {
+          const rowOffset = ((this.readDstY + y) & 511) * 1024;
+          for (let x = 0; x < this.readWidth; x++) {
+            this.imgReadBuffer[bufferIdx++] = this.vram[rowOffset + ((this.readDstX + x) & 1023)];
+          }
+        }
+
+        // Set GPUSTAT Bit 27: Ready to send VRAM to CPU
+        this.gpuStat |= (1 << 27);
         this.gp0Buffer = [];
       }
       return;
@@ -390,7 +515,13 @@ export class Gpu {
 
     if ((cmd >= 0x48 && cmd <= 0x4f) || (cmd >= 0x58 && cmd <= 0x5f)) {
       const lastWord = this.gp0Buffer[this.gp0Buffer.length - 1];
-      if (this.gp0Buffer.length >= 3 && ((lastWord & 0xFFFFFFFF) === 0x55555555 || ((lastWord >>> 16) === 0x5555 && (lastWord & 0xFFFF) === 0x5555))) {
+      if (
+        this.gp0Buffer.length >= 3 &&
+        ((lastWord & 0xFFFFFFFF) === 0x55555555 ||
+         (lastWord & 0xFFFFFFFF) === 0x50005000 ||
+         ((lastWord >>> 16) === 0x5555 && (lastWord & 0xFFFF) === 0x5555) ||
+         ((lastWord >>> 16) === 0x5000 && (lastWord & 0xFFFF) === 0x5000))
+      ) {
         this.executeGp0Packet(this.gp0Buffer);
         this.gp0Buffer = [];
       }
@@ -399,14 +530,34 @@ export class Gpu {
 
     const totalWords = getGp0PacketLength(this.gp0Buffer[0]);
     if (this.gp0Buffer.length >= totalWords) {
-      this.executeGp0Packet(this.gp0Buffer);
-      this.gp0Buffer = [];
+      const packet = this.gp0Buffer.slice(0, totalWords);
+      this.gp0Buffer = this.gp0Buffer.slice(totalWords);
+      this.executeGp0Packet(packet);
+      if (this.gp0Buffer.length > 0) {
+        this.checkAndExecutePrimitive();
+      }
     }
   }
 
   public writeGp1(val: number): void {
     val = val >>> 0;
+    this.gp1WriteCount++;
     const cmd = (val >>> 24) & 0xff;
+
+    if (this.onLog && cmd !== this._lastLoggedGp1Cmd) {
+      this._lastLoggedGp1Cmd = cmd;
+      let cmdDesc = `0x${cmd.toString(16).padStart(2, '0').toUpperCase()}`;
+      if (cmd === 0x00) cmdDesc += ' (Reset GPU)';
+      else if (cmd === 0x01) cmdDesc += ' (Reset Command Buffer)';
+      else if (cmd === 0x02) cmdDesc += ' (Acknowledge IRQ)';
+      else if (cmd === 0x03) cmdDesc += ` (Display ${((val & 1) !== 0) ? 'Disabled' : 'Enabled'})`;
+      else if (cmd === 0x04) cmdDesc += ' (DMA Direction / Data Request)';
+      else if (cmd === 0x05) cmdDesc += ' (Display Area Start in VRAM)';
+      else if (cmd === 0x06) cmdDesc += ' (Horizontal Display Range)';
+      else if (cmd === 0x07) cmdDesc += ' (Vertical Display Range)';
+      else if (cmd === 0x08) cmdDesc += ' (Display Mode / Resolution)';
+      this.onLog('gpu', `[GPU GP1 WRITE 0x1F801814] Control: ${cmdDesc} (Val: 0x${val.toString(16).toUpperCase()})`);
+    }
 
     switch (cmd) {
       case 0x00:
@@ -419,6 +570,9 @@ export class Gpu {
         break;
       case 0x02:
         this.gpuStat &= ~(1 << 24);
+        if (this.onAcknowledgeIrq) {
+          this.onAcknowledgeIrq();
+        }
         break;
       case 0x03:
         this.displayDisabled = (val & 1) !== 0;
@@ -440,13 +594,51 @@ export class Gpu {
         this.displayVramY = (val >>> 10) & 0x1FF;
         this.displayStartX = this.displayVramX;
         this.displayStartY = this.displayVramY;
+        console.log(`[GP1 DISPLAY START] Origin: (${this.displayVramX}, ${this.displayVramY})`);
+        if (this.onLog) {
+          this.onLog('gpu', `[GP1 DISPLAY START] Origin: (${this.displayVramX}, ${this.displayVramY})`);
+        }
         break;
-      case 0x06:
+      case 0x06: {
         this.displayHorizRange = val & 0x00ffffff;
+        const dispL = val & 0xFFF;
+        const dispR = (val >>> 12) & 0xFFF;
+        const dispW = Math.max(0, dispR - dispL);
+
+        const hresMode = (this.gpuStat >>> 16) & 7;
+        const maxWidths = [256, 368, 320, 368, 512, 368, 640, 368];
+        const divisors = [10, 7, 8, 7, 5, 7, 4, 7];
+
+        let calculatedWidth = Math.floor(dispW / (divisors[hresMode] || 8));
+        calculatedWidth = Math.min(maxWidths[hresMode] || 320, (calculatedWidth + 2) & ~3);
+
+        if (calculatedWidth > 0) {
+          this.displayWidth = calculatedWidth;
+          this.width = calculatedWidth;
+        }
         break;
-      case 0x07:
+      }
+
+      case 0x07: {
         this.displayVertRange = val & 0x00ffffff;
+        const dispT = val & 0x3FF;
+        let dispB = (val >>> 10) & 0x3FF;
+        if (dispB < dispT) dispB += 288;
+        const dispH = Math.max(0, dispB - dispT);
+
+        const vresMode = (this.gpuStat >>> 19) & 3;
+        const maxHeights = [240, 480, 256, 512];
+        const multipliers = [1, 2, 1, 2];
+
+        let calculatedHeight = (multipliers[vresMode] || 1) * dispH;
+        calculatedHeight = Math.min(maxHeights[vresMode] || 240, calculatedHeight);
+
+        if (calculatedHeight > 0) {
+          this.displayHeight = calculatedHeight;
+          this.height = calculatedHeight;
+        }
         break;
+      }
       case 0x08:
         {
           const hres1 = val & 0x03;
@@ -508,24 +700,28 @@ export class Gpu {
     switch (cmd) {
       case 0xe1:
         this.drawMode = val & 0x00ffffff;
+        this.currentTexpage = val & 0xffff;
         this.gpuStat = (this.gpuStat & ~0x000007ff) | (val & 0x000007ff);
         break;
       case 0xe2:
         this.textureWindow = val & 0x00ffffff;
         break;
       case 0xe3:
-        this.drawAreaX1 = val & 0x3ff;
-        this.drawAreaY1 = (val >>> 10) & 0x1ff;
+        this.drawAreaX1 = Math.min(1023, Math.max(0, val & 0x3ff));
+        this.drawAreaY1 = Math.min(511, Math.max(0, (val >>> 10) & 0x1ff));
         break;
       case 0xe4:
-        this.drawAreaX2 = val & 0x3ff;
-        this.drawAreaY2 = (val >>> 10) & 0x1ff;
+        this.drawAreaX2 = Math.min(1023, Math.max(0, val & 0x3ff));
+        this.drawAreaY2 = Math.min(511, Math.max(0, (val >>> 10) & 0x1ff));
         break;
       case 0xe5:
         this.drawOffsetX = (val << 21) >> 21;
         this.drawOffsetY = ((val >>> 11) << 21) >> 21;
         break;
       case 0xe6:
+        this.maskSet = (val & 1) !== 0;
+        this.maskCheck = (val & 2) !== 0;
+        this.gpuStat = (this.gpuStat & ~0x1800) | ((val & 3) << 11);
         break;
     }
   }
@@ -538,7 +734,12 @@ export class Gpu {
       if (this.transferCurY < this.transferHeight) {
         const vx = (this.transferDstX + this.transferCurX) & 1023;
         const vy = (this.transferDstY + this.transferCurY) & 511;
-        this.vram[vy * 1024 + vx] = pixel;
+        const offset = vy * 1024 + vx;
+        if (this.maskCheck && (this.vram[offset] & 0x8000) !== 0) {
+          // Pixel masked
+        } else {
+          this.vram[offset] = this.maskSet ? (pixel | 0x8000) : pixel;
+        }
         this.transferCurX++;
         if (this.transferCurX >= this.transferWidth) {
           this.transferCurX = 0;
@@ -587,6 +788,9 @@ export class Gpu {
       }
       if (cmd === 0x1f) {
         this.gpuStat |= (1 << 24);
+        if (this.onTriggerIrq) {
+          this.onTriggerIrq();
+        }
       }
       return;
     }
@@ -618,7 +822,9 @@ export class Gpu {
           const v2 = this.unpackVertex(words[5], this.drawOffsetX, this.drawOffsetY);
           const u2 = words[6] & 0xff, v2_uv = (words[6] >>> 8) & 0xff;
 
-          this.drawMode = (this.drawMode & ~0xffff) | (texpage & 0xffff);
+          this.currentTexpage = texpage;
+          this.gpuStat = (this.gpuStat & ~0x000007ff) | (texpage & 0x000007ff);
+
           const c = { r, g, b };
           this.drawTexturedTriangle(v0, { u: u0, v: v0_uv }, c, v1, { u: u1, v: v1_uv }, c, v2, { u: u2, v: v2_uv }, c, clut, texpage, isRaw, isSemiTransparent);
           this.framesRendered++;
@@ -650,7 +856,7 @@ export class Gpu {
           const clut = (words[2] >>> 16) & 0xffff;
           const texpage = (words[4] >>> 16) & 0xffff;
           this.currentTexpage = texpage;
-          this.drawMode = (this.drawMode & ~0xffff) | (texpage & 0xffff);
+          this.gpuStat = (this.gpuStat & ~0x000007ff) | (texpage & 0x000007ff);
 
           const v0 = this.unpackVertex(words[1], this.drawOffsetX, this.drawOffsetY);
           const uv0 = { u: words[2] & 0xff, v: (words[2] >>> 8) & 0xff };
@@ -697,7 +903,9 @@ export class Gpu {
           const v2 = this.unpackVertex(words[7], this.drawOffsetX, this.drawOffsetY);
           const u2 = words[8] & 0xff, v2_uv = (words[8] >>> 8) & 0xff;
 
-          this.drawMode = (this.drawMode & ~0xffff) | (texpage & 0xffff);
+          this.currentTexpage = texpage;
+          this.gpuStat = (this.gpuStat & ~0x000007ff) | (texpage & 0x000007ff);
+
           this.drawTexturedTriangle(v0, { u: u0, v: v0_uv }, c0, v1, { u: u1, v: v1_uv }, c1, v2, { u: u2, v: v2_uv }, c2, clut, texpage, isRaw, isSemiTransparent);
           this.framesRendered++;
         }
@@ -740,7 +948,9 @@ export class Gpu {
           const v3 = this.unpackVertex(words[10], this.drawOffsetX, this.drawOffsetY);
           const uv3 = { u: words[11] & 0xff, v: (words[11] >>> 8) & 0xff };
 
-          this.drawMode = (this.drawMode & ~0xffff) | (texpage & 0xffff);
+          this.currentTexpage = texpage;
+          this.gpuStat = (this.gpuStat & ~0x000007ff) | (texpage & 0x000007ff);
+
           this.drawTexturedTriangle(v0, uv0, c0, v1, uv1, c1, v2, uv2, c2, clut, texpage, isRaw, isSemiTransparent);
           this.drawTexturedTriangle(v1, uv1, c1, v3, uv3, c3, v2, uv2, c2, clut, texpage, isRaw, isSemiTransparent);
           this.framesRendered++;
@@ -790,9 +1000,13 @@ export class Gpu {
           let color = words[0];
           if (isRaw || (color & 0xffffff) === 0) color = 0x808080;
           const v0 = this.unpackVertex(words[1], this.drawOffsetX, this.drawOffsetY);
-          const u0 = words[2] & 0xff, v0_uv = (words[2] >>> 8) & 0xff, clut = (words[2] >>> 16) & 0xffff;
-          const w = words[3] & 0xffff, h = (words[3] >>> 16) & 0xffff;
-          this.drawTexturedRect(v0.x, v0.y, w, h, u0, v0_uv, clut, color, this.currentTexpage, isRaw, isSemiTransparent);
+          const u0 = words[2] & 0xff;
+          const v0_uv = (words[2] >>> 8) & 0xff;
+          const clut = (words[2] >>> 16) & 0xffff;
+          const w = words[3] & 0xffff;
+          const h = (words[3] >>> 16) & 0xffff;
+          const texpage = this.currentTexpage;
+          this.drawTexturedRect(v0.x, v0.y, w, h, u0, v0_uv, clut, color, texpage, isRaw, isSemiTransparent);
           this.framesRendered++;
         }
         break;
@@ -870,12 +1084,18 @@ export class Gpu {
         if (words.length >= 4) {
           const sx = words[1] & 0x3ff, sy = (words[1] >>> 16) & 0x1ff;
           const dx = words[2] & 0x3ff, dy = (words[2] >>> 16) & 0x1ff;
-          const w = words[3] & 0xffff, h = (words[3] >>> 16) & 0xffff;
+          const w = (((words[3] & 0xffff) - 1) & 0x3ff) + 1;
+          const h = ((((words[3] >>> 16) & 0xffff) - 1) & 0x1ff) + 1;
           for (let cy = 0; cy < h; cy++) {
             const srcRow = ((sy + cy) & 511) * 1024;
             const dstRow = ((dy + cy) & 511) * 1024;
             for (let cx = 0; cx < w; cx++) {
-              this.vram[dstRow + ((dx + cx) & 1023)] = this.vram[srcRow + ((sx + cx) & 1023)];
+              const srcPixel = this.vram[srcRow + ((sx + cx) & 1023)];
+              const dstOffset = dstRow + ((dx + cx) & 1023);
+              if (this.maskCheck && (this.vram[dstOffset] & 0x8000) !== 0) {
+                continue;
+              }
+              this.vram[dstOffset] = this.maskSet ? (srcPixel | 0x8000) : srcPixel;
             }
           }
           this.framesRendered++;
@@ -1009,7 +1229,11 @@ export class Gpu {
           const r5 = applyDither(r8, x, y, dither);
           const g5 = applyDither(g8, x, y, dither);
           const b5 = applyDither(b8, x, y, dither);
-          this.vram[rowOffset + (x & 1023)] = (b5 << 10) | (g5 << 5) | r5;
+          const dstIdx = rowOffset + (x & 1023);
+          if (this.maskCheck && (this.vram[dstIdx] & 0x8000) !== 0) continue;
+          let outPixel = (b5 << 10) | (g5 << 5) | r5;
+          if (this.maskSet) outPixel |= 0x8000;
+          this.vram[dstIdx] = outPixel;
         }
       }
     }
@@ -1062,7 +1286,11 @@ export class Gpu {
           const r5 = applyDither(r8, x, y, dither);
           const g5 = applyDither(g8, x, y, dither);
           const b5 = applyDither(b8, x, y, dither);
-          this.vram[rowOffset + (x & 1023)] = (b5 << 10) | (g5 << 5) | r5;
+          const dstIdx = rowOffset + (x & 1023);
+          if (this.maskCheck && (this.vram[dstIdx] & 0x8000) !== 0) continue;
+          let outPixel = (b5 << 10) | (g5 << 5) | r5;
+          if (this.maskSet) outPixel |= 0x8000;
+          this.vram[dstIdx] = outPixel;
         }
       }
     }
@@ -1130,7 +1358,11 @@ export class Gpu {
         const r5 = applyDither(r8, cx, cy, dither);
         const g5 = applyDither(g8, cx, cy, dither);
         const b5 = applyDither(b8, cx, cy, dither);
-        this.vram[row + (cx & 1023)] = (b5 << 10) | (g5 << 5) | r5;
+        const dstIdx = row + (cx & 1023);
+        if (this.maskCheck && (this.vram[dstIdx] & 0x8000) !== 0) continue;
+        let outPixel = (b5 << 10) | (g5 << 5) | r5;
+        if (this.maskSet) outPixel |= 0x8000;
+        this.vram[dstIdx] = outPixel;
       }
     }
   }
@@ -1170,9 +1402,9 @@ export class Gpu {
         const texel = this.sampleTexel(u, v, clut, texPageWord);
         if (texel.transparent || texel.raw16 === 0x0000) continue;
 
-        let rFinal = isRaw ? texel.r : Math.min(255, (texel.r * (tintR || 0x80)) >> 7);
-        let gFinal = isRaw ? texel.g : Math.min(255, (texel.g * (tintG || 0x80)) >> 7);
-        let bFinal = isRaw ? texel.b : Math.min(255, (texel.b * (tintB || 0x80)) >> 7);
+        let rFinal = isRaw ? texel.r : Math.min(255, (texel.r * tintR) >> 7);
+        let gFinal = isRaw ? texel.g : Math.min(255, (texel.g * tintG) >> 7);
+        let bFinal = isRaw ? texel.b : Math.min(255, (texel.b * tintB) >> 7);
 
         if (isSemiTransparent && texel.stp) {
           const bg16 = this.vram[destRow + (destX & 1023)];
@@ -1187,9 +1419,16 @@ export class Gpu {
         const g5 = applyDither(gFinal, destX, destY, dither);
         const b5 = applyDither(bFinal, destX, destY, dither);
 
+        const dstIdx = destRow + (destX & 1023);
+        if (this.maskCheck && (this.vram[dstIdx] & 0x8000) !== 0) continue;
+
         let bgr555 = (b5 << 10) | (g5 << 5) | r5;
-        if (bgr555 === 0 && (texel.stp || texel.raw16 === 0x8000)) bgr555 = 0x8000;
-        this.vram[destRow + (destX & 1023)] = bgr555;
+        if (this.maskSet || (texel.stp && !isSemiTransparent)) {
+          bgr555 |= 0x8000;
+        } else if (bgr555 === 0 && (texel.stp || texel.raw16 === 0x8000)) {
+          bgr555 = 0x8000;
+        }
+        this.vram[dstIdx] = bgr555;
       }
     }
   }
@@ -1234,9 +1473,9 @@ export class Gpu {
           const texel = this.sampleTexel(u, v, clut, texPageWord);
           if (texel.transparent || texel.raw16 === 0x0000) continue;
 
-          let rVert = Math.min(255, Math.max(0, Math.round(c0.r * w0 + c1.r * w1 + c2.r * w2))) || 0x80;
-          let gVert = Math.min(255, Math.max(0, Math.round(c0.g * w0 + c1.g * w1 + c2.g * w2))) || 0x80;
-          let bVert = Math.min(255, Math.max(0, Math.round(c0.b * w0 + c1.b * w1 + c2.b * w2))) || 0x80;
+          let rVert = Math.min(255, Math.max(0, Math.round(c0.r * w0 + c1.r * w1 + c2.r * w2)));
+          let gVert = Math.min(255, Math.max(0, Math.round(c0.g * w0 + c1.g * w1 + c2.g * w2)));
+          let bVert = Math.min(255, Math.max(0, Math.round(c0.b * w0 + c1.b * w1 + c2.b * w2)));
 
           let rFinal = isRaw ? texel.r : Math.min(255, (texel.r * rVert) >> 7);
           let gFinal = isRaw ? texel.g : Math.min(255, (texel.g * gVert) >> 7);
@@ -1255,9 +1494,16 @@ export class Gpu {
           const g5 = applyDither(gFinal, x, y, dither);
           const b5 = applyDither(bFinal, x, y, dither);
 
+          const dstIdx = rowOffset + (x & 1023);
+          if (this.maskCheck && (this.vram[dstIdx] & 0x8000) !== 0) continue;
+
           let bgr555 = (b5 << 10) | (g5 << 5) | r5;
-          if (bgr555 === 0 && (texel.stp || texel.raw16 === 0x8000)) bgr555 = 0x8000;
-          this.vram[rowOffset + (x & 1023)] = bgr555;
+          if (this.maskSet || (texel.stp && !isSemiTransparent)) {
+            bgr555 |= 0x8000;
+          } else if (bgr555 === 0 && (texel.stp || texel.raw16 === 0x8000)) {
+            bgr555 = 0x8000;
+          }
+          this.vram[dstIdx] = bgr555;
         }
       }
     }
@@ -1300,6 +1546,23 @@ export class Gpu {
     this.totalBlitMs += performance.now() - t0;
   }
 
+  public getDisplayNonZeroCountAt(startX: number, startY: number): number {
+    let count = 0;
+    const vram = this.vram;
+    const dispW = Math.min(320, this.displayWidth || 320);
+    const dispH = Math.min(240, this.displayHeight || 240);
+
+    for (let y = 0; y < dispH; y += 4) {
+      const vramY = (startY + y) & 511;
+      const vramRow = vramY * 1024;
+      for (let x = 0; x < dispW; x += 4) {
+        const vramX = (startX + x) & 1023;
+        if ((vram[vramRow + vramX] & 0x7fff) !== 0) count++;
+      }
+    }
+    return count;
+  }
+
   public extractFrame(): void {
     const dispW = Math.max(1, this.displayWidth || 320);
     const dispH = Math.max(1, this.displayHeight || 240);
@@ -1318,39 +1581,61 @@ export class Gpu {
 
     const data = this.completedFrame.data;
 
-    if (this.displayDisabled) {
-      for (let i = 0; i < dispW * dispH; i++) {
-        const dest = i * 4;
-        data[dest + 0] = 0;
-        data[dest + 1] = 0;
-        data[dest + 2] = 0;
-        data[dest + 3] = 255;
-      }
-      return;
-    }
-
     const startX = this.displayStartX & 1023;
     const startY = this.displayStartY & 511;
-    const vram = this.vram;
 
-    for (let y = 0; y < dispH; y++) {
-      const vramY = (startY + y) & 511;
-      const lineOffset = vramY * 1024;
-      const destOffset = y * dispW * 4;
+    if (this.is24BitColor) {
+      for (let y = 0; y < dispH; y++) {
+        const vramY = (startY + y) & 511;
+        const lineOffset = vramY * 1024;
+        const destOffset = y * dispW * 4;
 
-      for (let x = 0; x < dispW; x++) {
-        const vramX = (startX + x) & 1023;
-        const pixel = vram[lineOffset + vramX];
+        for (let x = 0; x < dispW; x++) {
+          const byteIndex = (startX * 2) + (x * 3);
+          const wordIndex = byteIndex >> 1;
+          const isOdd = (byteIndex & 1) !== 0;
 
-        const r = (pixel & 0x1f) << 3;
-        const g = ((pixel >> 5) & 0x1f) << 3;
-        const b = ((pixel >> 10) & 0x1f) << 3;
+          const w0 = this.vram[lineOffset + (wordIndex & 1023)];
+          const w1 = this.vram[lineOffset + ((wordIndex + 1) & 1023)];
 
-        const idx = destOffset + (x * 4);
-        data[idx + 0] = r;
-        data[idx + 1] = g;
-        data[idx + 2] = b;
-        data[idx + 3] = 255;
+          let r = 0, g = 0, b = 0;
+          if (!isOdd) {
+            r = w0 & 0xff;
+            g = (w0 >>> 8) & 0xff;
+            b = w1 & 0xff;
+          } else {
+            r = (w0 >>> 8) & 0xff;
+            g = w1 & 0xff;
+            b = (w1 >>> 8) & 0xff;
+          }
+
+          const idx = destOffset + (x * 4);
+          data[idx + 0] = r;
+          data[idx + 1] = g;
+          data[idx + 2] = b;
+          data[idx + 3] = 255;
+        }
+      }
+    } else {
+      for (let y = 0; y < dispH; y++) {
+        const vramY = (startY + y) & 511;
+        const lineOffset = vramY * 1024;
+        const destOffset = y * dispW * 4;
+
+        for (let x = 0; x < dispW; x++) {
+          const vramX = (startX + x) & 1023;
+          const pixel = this.vram[lineOffset + vramX];
+
+          const r = (pixel & 0x1F) << 3;
+          const g = ((pixel >>> 5) & 0x1F) << 3;
+          const b = ((pixel >>> 10) & 0x1F) << 3;
+
+          const idx = destOffset + (x * 4);
+          data[idx + 0] = r;
+          data[idx + 1] = g;
+          data[idx + 2] = b;
+          data[idx + 3] = 255;
+        }
       }
     }
   }

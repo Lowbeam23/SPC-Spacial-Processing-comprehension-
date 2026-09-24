@@ -2,10 +2,15 @@
  * PS1 Emulator Type Definitions
  */
 
+export enum BootMode {
+  BIOS_DASHBOARD = 'BIOS_DASHBOARD',
+  HLE_GAME_RUNNER = 'HLE_GAME_RUNNER',
+}
+
 export type ExecutionMode = 'jit' | 'interpreter' | 'hybrid';
 export type EmulationStatus = 'stopped' | 'running' | 'paused' | 'error';
 
-export type LogType = 'system' | 'bios' | 'tty' | 'disasm' | 'error' | 'warn' | 'gpu';
+export type LogType = 'system' | 'bios' | 'tty' | 'disasm' | 'error' | 'warn' | 'gpu' | 'gte';
 
 export interface ConsoleLog {
   id: string;
@@ -24,6 +29,37 @@ export interface BiosInfo {
   isOfficial?: boolean;
   checksum?: string;
   loadedAt: number;
+}
+
+export interface VirtualDiscTrack {
+  trackNumber: number;
+  offset: number;
+  sectorSize: number;
+  type: string;
+}
+
+export interface VirtualDisc {
+  name: string;
+  buffer: ArrayBuffer;
+  data: Uint8Array;
+  sectorSize: number;
+  totalSectors: number;
+  cueSheet?: string;
+  primaryExecutable?: string;
+  systemCnf?: string;
+  volumeLabel?: string;
+  tracks?: VirtualDiscTrack[];
+}
+
+export interface ParsedExecutable {
+  entryPc: number;
+  loadAddr: number;
+  loadSize: number;
+  data: Uint8Array;
+  initialSp?: number;
+  initialGp?: number;
+  bssAddr?: number;
+  bssSize?: number;
 }
 
 export interface DiscInfo {
@@ -78,6 +114,16 @@ export interface GpuState {
   framesRendered: number;
   readyForCommands: boolean;
   readyForDma: boolean;
+  gp0WriteCount?: number;
+  gp1WriteCount?: number;
+  dma2PacketCount?: number;
+  vblankIrqCount?: number;
+  totalVramNonZero?: number;
+  displayNonZero?: number;
+  displayStartX?: number;
+  displayStartY?: number;
+  displayDisabled?: boolean;
+  vramFirst16WordsHex?: string;
 }
 
 export const MIPS_REGISTER_NAMES = [

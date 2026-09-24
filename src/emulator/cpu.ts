@@ -8,7 +8,8 @@ import { Memory } from './memory';
 import { Gte } from './gte';
 import { CpuState, MIPS_REGISTER_NAMES } from '../types';
 import { disassemble } from './disassembler';
-import { logWarnRateLimited, logErrorRateLimited } from './logger';
+import { rateLimitLog, logWarnRateLimited, logErrorRateLimited } from './logger';
+import { HleBiosDispatcher } from './hleBios';
 
 export type SyscallCallback = (pc: number, func: string, args: number[]) => void;
 export type InstructionCallback = (pc: number, opcode: number, disasm: string) => void;
@@ -50,6 +51,8 @@ export class Cpu {
   public nextPc: number = 0xbfc00004;
   public hi: number = 0;
   public lo: number = 0;
+  public lastExceptionPc: number = 0;
+  public consecutiveExceptionCount: number = 0;
 
   // Full COP0 Register Bank (32 registers)
   public cop0Regs: Uint32Array = (() => {
@@ -132,11 +135,28 @@ export class Cpu {
   public justReturnedFromException: boolean = false;
   public _hasLoggedMaskedIrq: boolean = false;
   public _hasLoggedCdRomIrqPending: boolean = false;
+  public _hasLoggedSpinlock: boolean = false;
+  public _hasLoggedAE418: boolean = false;
+  public _hasLoggedS0Target: boolean = false;
+  public _hasLoggedAE3E0Prologue: boolean = false;
+  public _hasLoggedAD8F8: boolean = false;
+  public _hasLoggedAD9A0: boolean = false;
+  public _hasLoggedAD9A0_val: boolean = false;
+  public _hasLoggedAD9C0: boolean = false;
+  public _hasLoggedB27C0: boolean = false;
+  public _hasLoggedAA484: boolean = false;
+  public _hasLogged3C398: boolean = false;
+  public _hasLoggedTarget3C398: boolean = false;
+  public _hasLoggedC8FA8: boolean = false;
+  public _hasLoggedExitC8FD4: boolean = false;
+  public _vramWaitFrames: number = 0;
+  public _loggedExit: boolean = false;
   public lastLoggedVblank: number = -1;
   public postSyscallTraceRemaining: number = 0;
   public gteOpCount: number = 0;
   public syscallTrapCount: number = 0;
   public biosVectorTrapCount: number = 0;
+  public hleBiosEnabled: boolean = false;
   public executionHistory: { pc: number; opcode: number }[] = [];
 
   /**
@@ -177,12 +197,40 @@ export class Cpu {
     return false;
   }
 
+  public setReg(regIndex: number, val: number): void {
+    if (regIndex > 0 && regIndex < 32) {
+      this.regs[regIndex] = val >>> 0;
+    }
+  }
+
+  public getReg(regIndex: number): number {
+    if (regIndex >= 0 && regIndex < 32) {
+      return this.regs[regIndex] >>> 0;
+    }
+    return 0;
+  }
+
   public get cop0() {
     const self = this;
     return {
-      get status(): number { return self.cop0Regs[12] >>> 0; },
-      set status(val: number) {
-        const uval = val >>> 0;
+      get status(): any {
+        const val = self.cop0Regs[12] >>> 0;
+        return {
+          valueOf() { return val; },
+          toString() { return val.toString(); },
+          get bev(): number { return (val & (1 << 22)) !== 0 ? 1 : 0; },
+          set bev(b: number) {
+            if (b) {
+              self.cop0Regs[12] = (self.cop0Regs[12] | (1 << 22)) >>> 0;
+            } else {
+              self.cop0Regs[12] = (self.cop0Regs[12] & ~(1 << 22)) >>> 0;
+            }
+          }
+        };
+      },
+      set status(val: any) {
+        const numVal = typeof val === 'number' ? val : Number(val);
+        const uval = (numVal || 0) >>> 0;
         self.cop0Regs[12] = uval;
         self.memory.isCacheIsolated = (uval & 0x00010000) !== 0;
       },
@@ -203,10 +251,21 @@ export class Cpu {
 
   // RFE opcode (COP0 function 0x10):
   public executeRfe(): void {
-    const status = this.cop0Regs[12];
-    const mode = status & 0x3F;
-    this.cop0Regs[12] = (((status & ~0x0F) | (mode >> 2))) >>> 0;
+    const statusBefore = this.cop0Regs[12];
+    const mode = statusBefore & 0x3F;
+    // Shift mode bits (bits 5-0) right by 2:
+    // [KUc, IEc] <- [KUp, IEp] <- [KUo, IEo]
+    const newMode = ((mode >> 2) & 0x0F) | (mode & 0x30);
+    const newStatus = ((statusBefore & ~0x3F) | newMode) >>> 0;
+    this.cop0Regs[12] = newStatus;
     this.memory.isCacheIsolated = (this.cop0Regs[12] & 0x00010000) !== 0;
+
+    const iecRestored = newStatus & 1;
+    const rfeMsg = `[CPU RFE] Executing return from exception | Status Before: 0x${statusBefore.toString(16).toUpperCase()} -> Status After: 0x${newStatus.toString(16).toUpperCase()} (IEc restored to ${iecRestored})`;
+    rateLimitLog('cpu_rfe_exec', 'warn', rfeMsg, 5);
+    if (this.memory.onLog) {
+      this.memory.onLog('bios', rfeMsg, this.pc);
+    }
   }
 
   // Debug callbacks
@@ -261,6 +320,7 @@ export class Cpu {
     this.gteOpCount = 0;
     this.syscallTrapCount = 0;
     this.biosVectorTrapCount = 0;
+    this.hleBiosEnabled = false;
     this.executionHistory = [];
 
     this.memory.isCacheIsolated = false;
@@ -362,6 +422,9 @@ export class Cpu {
       currentSr = 0x10900000;
       this.cop0Regs[12] = currentSr;
     }
+    const statusBefore = currentSr;
+    const iecBefore = statusBefore & 1;
+
     // Shift mode bits (bits 5-0): push [KUc, IEc] -> [KUp, IEp] -> [KUo, IEo]
     const mode = currentSr & 0x3F;
     const newMode = (mode << 2) & 0x3F;
@@ -376,6 +439,24 @@ export class Cpu {
     this.inDelaySlot = false;
     this.branchPending = false;
     this.exceptionTriggeredInStep = true;
+
+    const isSamePc = (this.lastExceptionPc === currentPc);
+    if (isSamePc) {
+      this.consecutiveExceptionCount++;
+    } else {
+      this.lastExceptionPc = currentPc;
+      this.consecutiveExceptionCount = 1;
+    }
+
+    if (this.debugLogging || this.consecutiveExceptionCount <= 1) {
+      const entryKey = `cpu_exc_entry_${causeExc}_${currentPc}`;
+      const entryMsg = `[CPU EXCEPTION] Entry | PC: 0x${currentPc.toString(16).toUpperCase()} | Cause: 0x${this.cause.toString(16).toUpperCase()} | Status Before: 0x${statusBefore.toString(16).toUpperCase()} (IEc=${iecBefore})`;
+      if (rateLimitLog(entryKey, 'warn', entryMsg, 3)) {
+        if (this.memory.onLog && this.debugLogging) {
+          this.memory.onLog('bios', entryMsg, currentPc);
+        }
+      }
+    }
   }
 
   /**
@@ -443,8 +524,8 @@ export class Cpu {
       return false; // Inhibit latch or delay slot
     }
 
-    // If master interrupt enable is set and any motherboard IRQ is unmasked:
-    if (iec && hardwarePending && (im2Enabled || (this.cop0Regs[12] & 0xFF00) === 0)) {
+    // If master interrupt enable is set and hardware IP2 interrupt line is unmasked:
+    if (iec && hardwarePending && im2Enabled) {
       this.triggerException(0x00, this.pc, this.inDelaySlot); // Exception code 0 = Interrupt
       return true;
     }
@@ -555,59 +636,309 @@ export class Cpu {
     const currentPc = this.pc;
     this.memory.currentCpuPc = currentPc;
 
-    // Direct BIOS A0/B0/C0 vector dispatch if RAM jump tables are empty
-    if (physicalPc === 0xa0 || physicalPc === 0xb0 || physicalPc === 0xc0) {
-      const opcAtVector = this.memory.read32(currentPc);
-      if (opcAtVector === 0 || opcAtVector === 0xffffffff) {
-        const funcNum = (physicalPc === 0xc0) ? this.regs[4] : (this.regs[9] || this.regs[4]);
-        this.regs[2] = 1; // Default success return in $v0
-
-        if (physicalPc === 0xb0 && funcNum === 0x08) {
-          this.regs[2] = 0xf0000001; // Event descriptor
-        } else if (physicalPc === 0xa0 && funcNum === 0x39) {
-          this.regs[2] = 0; // InitGeom returns 0
+    // Direct BIOS 80/A0/B0/C0 vector dispatch - STRICTLY GUARDED by hleBiosEnabled
+    // When running Branch A (Authentic BIOS), low-RAM vectors are handled naturally by Sony ROM without any interception
+    if (this.hleBiosEnabled && physicalPc === 0x80) {
+      const causeExc = (this.cop0Regs[13] >>> 2) & 0x1f;
+      if (causeExc === 0) {
+        // Hardware Interrupt: Handle device request and clear I_STAT before returning to EPC
+        if ((this.memory.iStat & 1) !== 0) {
+          this.memory.deliverVblankEvent();
         }
+        this.memory.writeIStat(0);
+        this.executeRfe();
+        const returnEpc = this.cop0Regs[14] >>> 0;
+        this.pc = returnEpc;
+        this.nextPc = (returnEpc + 4) >>> 0;
+        this.inDelaySlot = false;
+        this.branchPending = false;
+        return 4;
+      } else {
+        // Software Trap / Syscall / Unhandled Instruction: Add 4 to EPC before executing rfe or returning
+        const returnEpc = ((this.cop0Regs[14] >>> 0) + 4) >>> 0;
+        this.cop0Regs[14] = returnEpc;
+        this.epc = returnEpc;
+        this.executeRfe();
+        this.pc = returnEpc;
+        this.nextPc = (returnEpc + 4) >>> 0;
+        this.inDelaySlot = false;
+        this.branchPending = false;
+        return 4;
+      }
+    }
 
-        const returnRa = this.regs[31] >>> 0;
-        if (returnRa !== 0) {
-          if (this.memory.onLog) {
-            this.memory.onLog('bios', `[BIOS VECTOR 0x${physicalPc.toString(16).toUpperCase()}] Handled vector fn 0x${funcNum.toString(16)} -> JR $ra (0x${returnRa.toString(16).toUpperCase()}), $v0=0x${this.regs[2].toString(16)}`, currentPc);
+    if (this.hleBiosEnabled && (physicalPc === 0xa0 || physicalPc === 0xb0 || physicalPc === 0xc0)) {
+      const res = HleBiosDispatcher.dispatchVector(physicalPc, this, this.memory);
+      const returnRa = this.regs[31] >>> 0;
+      if (this.debugLogging && this.memory.onLog) {
+        const logMsg = `[HLE BIOS VECTOR 0x${physicalPc.toString(16).toUpperCase()}] Service 0x${res.fnId.toString(16).toUpperCase()} (${res.serviceName}) from ${res.sourceReg}=0x${res.fnId.toString(16).toUpperCase()} -> JR $ra (0x${returnRa.toString(16).toUpperCase()}), $v0=0x${this.regs[2].toString(16).toUpperCase()}`;
+        this.memory.onLog('bios', logMsg, currentPc);
+      }
+      if (returnRa !== 0) {
+        this.pc = returnRa;
+        this.nextPc = (returnRa + 4) >>> 0;
+        this.inDelaySlot = false;
+        this.branchPending = false;
+        return 4;
+      } else {
+        this.reportError(`[BIOS VECTOR TRAP] Fetched from vector 0x${physicalPc.toString(16).toUpperCase()} with $ra=0x0`, currentPc);
+        this.halted = true;
+        return 4;
+      }
+    }
+
+    if (this.pc === 0x800AD8F8 && !this._hasLoggedAD8F8) {
+      this._hasLoggedAD8F8 = true;
+      const header = '=== DISASSEMBLY OF INITIATING FUNCTION 0x800AD8F8 ===';
+      console.log(header);
+      if (this.memory.onLog) this.memory.onLog('bios', header, this.pc);
+      for (let addr = 0x800AD8F8; addr <= 0x800AD938; addr += 4) {
+        const word = this.memory.read32(addr);
+        let asm = 'unknown';
+        try {
+          asm = disassemble(addr, word).assembly;
+        } catch {
+          asm = 'unknown';
+        }
+        const line = `  0x${addr.toString(16).toUpperCase()}: 0x${word.toString(16).padStart(8, '0').toUpperCase()} -> ${asm}`;
+        console.log(line);
+        if (this.memory.onLog) this.memory.onLog('bios', line, addr);
+      }
+    }
+
+    if (this.pc === 0x800AD9A0) {
+      if (!this._hasLoggedAD9A0) {
+        this._hasLoggedAD9A0 = true;
+        const header = '=== DISASSEMBLY AT 0x800AD990 - 0x800AD9C0 ===';
+        console.log(header);
+        if (this.memory.onLog) this.memory.onLog('bios', header, this.pc);
+        for (let addr = 0x800AD990; addr <= 0x800AD9C0; addr += 4) {
+          const word = this.memory.read32(addr);
+          let asm = 'unknown';
+          try {
+            asm = disassemble(addr, word).assembly;
+          } catch {
+            asm = 'unknown';
           }
-          this.pc = returnRa;
-          this.nextPc = (returnRa + 4) >>> 0;
-          this.inDelaySlot = false;
-          this.branchPending = false;
-          return 4;
-        } else {
-          this.reportError(`[BIOS VECTOR TRAP] Fetched from vector 0x${physicalPc.toString(16).toUpperCase()} with $ra=0x0`, currentPc);
-          this.halted = true;
-          return 4;
+          const line = `  0x${addr.toString(16).toUpperCase()}: 0x${word.toString(16).padStart(8, '0').toUpperCase()} -> ${asm}`;
+          console.log(line);
+          if (this.memory.onLog) this.memory.onLog('bios', line, addr);
+        }
+      }
+
+      if (!this._hasLoggedAD9A0_val) {
+        this._hasLoggedAD9A0_val = true;
+        const busyVal = this.memory.read32(0x80127114);
+        const msg = `[CD BUSY CHECK] memory[0x80127114] = 0x${busyVal.toString(16).toUpperCase()}`;
+        console.log(msg);
+        if (this.memory.onLog) {
+          this.memory.onLog('bios', msg, this.pc);
         }
       }
     }
 
-    if (currentPc === 0x80069570 || currentPc === 0x80069574) {
-      const opc = this.memory.read32(currentPc);
-      let disasm = '';
-      try {
-        disasm = disassemble(currentPc, opc).assembly;
-      } catch {
-        disasm = 'unknown';
+    if (this.pc === 0x800AD9C0 && !this._hasLoggedAD9C0) {
+      this._hasLoggedAD9C0 = true;
+      const header = '=== DISASSEMBLY AT 0x800AD9C0 - 0x800AD9E0 ===';
+      console.log(header);
+      if (this.memory.onLog) this.memory.onLog('bios', header, this.pc);
+      for (let addr = 0x800AD9C0; addr <= 0x800AD9E0; addr += 4) {
+        const word = this.memory.read32(addr);
+        let asm = 'unknown';
+        try {
+          asm = disassemble(addr, word).assembly;
+        } catch {
+          asm = 'unknown';
+        }
+        const line = `  0x${addr.toString(16).toUpperCase()}: 0x${word.toString(16).padStart(8, '0').toUpperCase()} -> ${asm}`;
+        console.log(line);
+        if (this.memory.onLog) this.memory.onLog('bios', line, addr);
       }
-      const printReg = (num: number) => `0x${(this.regs[num] >>> 0).toString(16).padStart(8, '0').toUpperCase()}`;
-      const logMsg = `[JUMP SITE DIAGNOSTIC at 0x${currentPc.toString(16).toUpperCase()}]:\n` +
-        `  Instruction: ${disasm} (Opcode: 0x${opc.toString(16).padStart(8, '0').toUpperCase()})\n` +
-        `  $v0: ${printReg(2)} | $v1: ${printReg(3)}\n` +
-        `  $a0: ${printReg(4)} | $a1: ${printReg(5)} | $a2: ${printReg(6)} | $a3: ${printReg(7)}\n` +
-        `  $t0: ${printReg(8)} | $t1: ${printReg(9)} | $t2: ${printReg(10)} | $t3: ${printReg(11)}\n` +
-        `  $t4: ${printReg(12)} | $t5: ${printReg(13)} | $t6: ${printReg(14)} | $t7: ${printReg(15)}\n` +
-        `  $t8: ${printReg(24)} | $t9: ${printReg(25)}\n` +
-        `  $s0: ${printReg(16)} | $s1: ${printReg(17)} | $s2: ${printReg(18)} | $s3: ${printReg(19)}\n` +
-        `  $gp: ${printReg(28)} | $sp: ${printReg(29)} | $fp: ${printReg(30)} | $ra: ${printReg(31)}`;
-      
-      console.log(logMsg);
+    }
+
+    if (this.pc === 0x800B27C0 && !this._hasLoggedB27C0) {
+      this._hasLoggedB27C0 = true;
+      const header = '=== DISASSEMBLY OF GPU SYNC LOOP (0x800B27B8 - 0x800B27D8) ===';
+      console.log(header);
+      if (this.memory.onLog) this.memory.onLog('bios', header, this.pc);
+      for (let addr = 0x800B27B8; addr <= 0x800B27D8; addr += 4) {
+        const word = this.memory.read32(addr);
+        let asm = 'unknown';
+        try {
+          asm = disassemble(addr, word).assembly;
+        } catch {
+          asm = 'unknown';
+        }
+        const line = `  0x${addr.toString(16).toUpperCase()}: 0x${word.toString(16).padStart(8, '0').toUpperCase()} -> ${asm}`;
+        console.log(line);
+        if (this.memory.onLog) this.memory.onLog('bios', line, addr);
+      }
+    }
+
+    if (this.pc === 0x800AA484 && !this._hasLoggedAA484) {
+      this._hasLoggedAA484 = true;
+      const header = '=== DISASSEMBLY OF MAIN LOOP (0x800AA478 - 0x800AA4B0) ===';
+      console.log(header);
+      if (this.memory.onLog) this.memory.onLog('bios', header, this.pc);
+      for (let addr = 0x800AA478; addr <= 0x800AA4B0; addr += 4) {
+        const word = this.memory.read32(addr);
+        let asm = 'unknown';
+        try {
+          asm = disassemble(addr, word).assembly;
+        } catch {
+          asm = 'unknown';
+        }
+        const line = `  0x${addr.toString(16).toUpperCase()}: 0x${word.toString(16).padStart(8, '0').toUpperCase()} -> ${asm}`;
+        console.log(line);
+        if (this.memory.onLog) this.memory.onLog('bios', line, addr);
+      }
+    }
+
+    if (this.pc === 0x8003C398) {
+      if (!this._hasLogged3C398) {
+        this._hasLogged3C398 = true;
+        const header = '=== DISASSEMBLY OF FUNCTION AROUND 0x8003C340 - 0x8003C3E0 ===';
+        console.log(header);
+        if (this.memory.onLog) this.memory.onLog('bios', header, this.pc);
+        for (let addr = 0x8003C340; addr <= 0x8003C3E0; addr += 4) {
+          const word = this.memory.read32(addr);
+          let asm = 'unknown';
+          try {
+            asm = disassemble(addr, word).assembly;
+          } catch {
+            asm = 'unknown';
+          }
+          const line = `  0x${addr.toString(16).toUpperCase()}: 0x${word.toString(16).padStart(8, '0').toUpperCase()} -> ${asm}`;
+          console.log(line);
+          if (this.memory.onLog) this.memory.onLog('bios', line, addr);
+        }
+
+        const sp = this.regs[29] >>> 0;
+        const savedRa = this.memory.read32(sp + 64);
+        const stackMsg = `[FUNCTION 0x8003C380 CALLER] $sp: 0x${sp.toString(16).toUpperCase()} | Return RA at 64($sp): 0x${savedRa.toString(16).toUpperCase()}`;
+        console.log(stackMsg);
+        if (this.memory.onLog) this.memory.onLog('bios', stackMsg, this.pc);
+      }
+
+      const baseReg = this.regs[3] >>> 0; // $v1 = reg 3
+      const targetAddr = (baseReg + -30404) >>> 0;
+      if (!this._hasLoggedTarget3C398) {
+        this._hasLoggedTarget3C398 = true;
+        const msg = `[VRAM PRE-DISPATCH] $s0/$v1: 0x${baseReg.toString(16).toUpperCase()} | Target Polled Address: 0x${targetAddr.toString(16).toUpperCase()} | Current Value: 0x${this.memory.read32(targetAddr).toString(16).toUpperCase()}`;
+        console.log(msg);
+        if (this.memory.onLog) {
+          this.memory.onLog('bios', msg, this.pc);
+        }
+      }
+    }
+
+    if (this.pc === 0x800C8FA8 && !this._hasLoggedC8FA8) {
+      this._hasLoggedC8FA8 = true;
+      const header = '=== DISASSEMBLY OF GPU BLIT LOOP (0x800C8FA0 - 0x800C8FD0) ===';
+      console.log(header);
+      if (this.memory.onLog) this.memory.onLog('bios', header, this.pc);
+      for (let addr = 0x800C8FA0; addr <= 0x800C8FD0; addr += 4) {
+        const word = this.memory.read32(addr);
+        let asm = 'unknown';
+        try {
+          asm = disassemble(addr, word).assembly;
+        } catch {
+          asm = 'unknown';
+        }
+        const line = `  0x${addr.toString(16).toUpperCase()}: 0x${word.toString(16).padStart(8, '0').toUpperCase()} -> ${asm}`;
+        console.log(line);
+        if (this.memory.onLog) this.memory.onLog('bios', line, addr);
+      }
+
+      const v0Hex = (this.regs[2] >>> 0).toString(16).toUpperCase();
+      const v1Hex = (this.regs[3] >>> 0).toString(16).toUpperCase();
+      const a0Hex = (this.regs[4] >>> 0).toString(16).toUpperCase();
+      const a1Hex = (this.regs[5] >>> 0).toString(16).toUpperCase();
+      const t0Hex = (this.regs[8] >>> 0).toString(16).toUpperCase();
+      const raHex = (this.regs[31] >>> 0).toString(16).toUpperCase();
+      const regMsg = `[REGS AT 0x800C8FA8] $v0: 0x${v0Hex} | $v1: 0x${v1Hex} | $a0: 0x${a0Hex} | $a1: 0x${a1Hex} | $t0: 0x${t0Hex} | $ra: 0x${raHex}`;
+      console.log(regMsg);
+      if (this.memory.onLog) this.memory.onLog('bios', regMsg, this.pc);
+    }
+
+    if (this.pc > 0x800C8FD4 && this.pc < 0x800C9500 && !this._hasLoggedExitC8FD4) {
+      this._hasLoggedExitC8FD4 = true;
+      const msg = `[MAIN LOOP ADVANCED] CPU unlocked from 0x800C8FD0! New PC: 0x${this.pc.toString(16).toUpperCase()} | $ra: 0x${(this.regs[31] >>> 0).toString(16).toUpperCase()}`;
+      console.log(msg);
       if (this.memory.onLog) {
-        this.memory.onLog('system', logMsg, currentPc);
+        this.memory.onLog('bios', msg, this.pc);
+      }
+    }
+
+    if (this.pc === 0x800CC3A8) {
+      if (!this._hasLoggedSpinlock) {
+        this._hasLoggedSpinlock = true;
+        const valD000 = this.memory.read32(0x8012D000);
+        const val404C = this.memory.read32(0x800E404C);
+        const msg = `[SPINLOCK CHECK] v0: 0x${(this.regs[2] >>> 0).toString(16)}, v1 (0x8012D000): 0x${(valD000 >>> 0).toString(16)}, mem[0x800E404C]: 0x${(val404C >>> 0).toString(16)}`;
+        console.log(msg);
+        if (this.memory.onLog) {
+          this.memory.onLog('bios', msg, this.pc);
+        }
+      }
+    }
+
+    if (this.pc === 0x800AE418) {
+      if (!this._hasLoggedAE418) {
+        this._hasLoggedAE418 = true;
+        const header = '=== DISASSEMBLY AT 0x800AE410 - 0x800AE430 ===';
+        console.log(header);
+        if (this.memory.onLog) this.memory.onLog('bios', header, this.pc);
+        for (let addr = 0x800AE410; addr <= 0x800AE430; addr += 4) {
+          const word = this.memory.read32(addr);
+          let asm = 'unknown';
+          try {
+            asm = disassemble(addr, word).assembly;
+          } catch {
+            asm = 'unknown';
+          }
+          const line = `  0x${addr.toString(16).toUpperCase()}: 0x${word.toString(16).padStart(8, '0').toUpperCase()} -> ${asm}`;
+          console.log(line);
+          if (this.memory.onLog) this.memory.onLog('bios', line, addr);
+        }
+      }
+
+      if (!this._hasLoggedS0Target) {
+        this._hasLoggedS0Target = true;
+        const s0 = this.regs[16] >>> 0;
+        const targetAddr = (s0 + 0x7A58) >>> 0;
+        const currentVal = this.memory.read32(targetAddr);
+        const msg = `[COMPLETION FLAG POLL] $s0: 0x${s0.toString(16).toUpperCase()}, Target Address: 0x${targetAddr.toString(16).toUpperCase()}, Current Value: 0x${currentVal.toString(16).toUpperCase()}`;
+        console.log(msg);
+        if (this.memory.onLog) this.memory.onLog('bios', msg, this.pc);
+      }
+
+      if (!this._hasLoggedAE3E0Prologue) {
+        this._hasLoggedAE3E0Prologue = true;
+        const header = '=== FUNCTION PROLOGUE DISASSEMBLY (0x800AE3E0 - 0x800AE410) ===';
+        console.log(header);
+        if (this.memory.onLog) this.memory.onLog('bios', header, this.pc);
+        for (let addr = 0x800AE3E0; addr <= 0x800AE410; addr += 4) {
+          const word = this.memory.read32(addr);
+          let asm = 'unknown';
+          try {
+            asm = disassemble(addr, word).assembly;
+          } catch {
+            asm = 'unknown';
+          }
+          const line = `  0x${addr.toString(16).toUpperCase()}: 0x${word.toString(16).padStart(8, '0').toUpperCase()} -> ${asm}`;
+          console.log(line);
+          if (this.memory.onLog) this.memory.onLog('bios', line, addr);
+        }
+      }
+    }
+
+    if ((this.pc & 0xffffff00) !== 0x800ae400 && this.memory._cdWaitFrames > 5 && !this._loggedExit) {
+      this._loggedExit = true;
+      const msg = `[ENGINE UNLOCKED] Jumped to PC: 0x${this.pc.toString(16).toUpperCase()} | $ra: 0x${(this.regs[31] >>> 0).toString(16).toUpperCase()}`;
+      console.log(msg);
+      if (this.memory.onLog) {
+        this.memory.onLog('bios', msg, this.pc);
       }
     }
 
@@ -840,21 +1171,21 @@ export class Cpu {
         } else {
           switch (rs) {
             case 0x00: // MFC2 rt, rd (Move from GTE data register)
-              this.regs[rt] = this.gte ? this.gte.readDataRegister(rd) : 0;
+              this.regs[rt] = this.gte ? this.gte.readData(rd) : 0;
               this.regs[0] = 0;
               break;
             case 0x02: // CFC2 rt, rd (Move from GTE control register)
-              this.regs[rt] = this.gte ? this.gte.readControlRegister(rd) : 0;
+              this.regs[rt] = this.gte ? this.gte.readCtrl(rd) : 0;
               this.regs[0] = 0;
               break;
             case 0x04: // MTC2 rt, rd (Move to GTE data register)
               if (this.gte) {
-                this.gte.writeDataRegister(rd, this.regs[rt]);
+                this.gte.writeData(rd, this.regs[rt]);
               }
               break;
             case 0x06: // CTC2 rt, rd (Move to GTE control register)
               if (this.gte) {
-                this.gte.writeControlRegister(rd, this.regs[rt]);
+                this.gte.writeCtrl(rd, this.regs[rt]);
               }
               break;
           }
@@ -1280,6 +1611,14 @@ export class Cpu {
         break;
       case 0x08: // JR
         if (this.regs[rs] === 0) {
+          const recoveryRa = this.regs[31] >>> 0;
+          if (recoveryRa !== 0 && recoveryRa !== currentPc) {
+            if (this.memory.onLog) {
+              this.memory.onLog('warn', `[MIPS RECOVERY] JR $0 encountered at PC: 0x${currentPc.toString(16).toUpperCase()} - recovering via $ra (0x${recoveryRa.toString(16).toUpperCase()})`, currentPc);
+            }
+            this.triggerBranch(recoveryRa);
+            return;
+          }
           this.reportError(`[NULL DEREFERENCE] Attempted JR to 0x0 from $r${rs}. $ra=0x${this.regs[31].toString(16)}, $t9=0x${this.regs[25].toString(16)}, $k0=0x${this.regs[26].toString(16)}, $k1=0x${this.regs[27].toString(16)}`, currentPc);
           this.halted = true;
           return;
@@ -1288,6 +1627,15 @@ export class Cpu {
         break;
       case 0x09: // JALR
         if (this.regs[rs] === 0) {
+          const recoveryRa = this.regs[31] >>> 0;
+          this.regs[rd] = (currentPc + 8) >>> 0;
+          if (recoveryRa !== 0 && recoveryRa !== currentPc) {
+            if (this.memory.onLog) {
+              this.memory.onLog('warn', `[MIPS RECOVERY] JALR $0 encountered at PC: 0x${currentPc.toString(16).toUpperCase()} - returning via $ra (0x${recoveryRa.toString(16).toUpperCase()})`, currentPc);
+            }
+            this.triggerBranch(recoveryRa);
+            return;
+          }
           this.reportError(`[NULL DEREFERENCE] Attempted JALR to 0x0 from $r${rs}. $ra=0x${this.regs[31].toString(16)}, $t9=0x${this.regs[25].toString(16)}, $k0=0x${this.regs[26].toString(16)}, $k1=0x${this.regs[27].toString(16)}`, currentPc);
           this.halted = true;
           return;
@@ -1302,12 +1650,11 @@ export class Cpu {
         break;
       case 0x0c: // SYSCALL
         {
-          const v0 = this.regs[2];
-          const a0 = this.regs[4];
-          const a1 = this.regs[5];
-          const a2 = this.regs[6];
-          const a3 = this.regs[7];
-          const t1 = this.regs[9];
+          const a0 = this.regs[4] >>> 0;
+          const a1 = this.regs[5] >>> 0;
+          const a2 = this.regs[6] >>> 0;
+          const a3 = this.regs[7] >>> 0;
+          const t1 = this.regs[9] >>> 0;
           const ra = this.regs[31] >>> 0;
 
           if (this.onSyscall) {
@@ -1320,33 +1667,25 @@ export class Cpu {
           const bev = (this.cop0Regs[12] & (1 << 22)) !== 0;
           const targetVector = bev ? 0xbfc00180 : 0x80000080;
           const vectorFirstInstr = this.memory.read32(targetVector);
-          const hasInstalledVector = vectorFirstInstr !== 0 && vectorFirstInstr !== 0xffffffff;
+          const hasInstalledVector = bev || (vectorFirstInstr !== 0 && vectorFirstInstr !== 0xffffffff && vectorFirstInstr !== 0x0000000c && vectorFirstInstr !== 0x401a7000);
 
-          if (!hasInstalledVector) {
-            // Clean HLE fallback when running without installed kernel exception vector
-            if (a0 === 1) {
-              // EnterCriticalSection: disable interrupts, return 1 in $v0
-              this.cop0Regs[12] &= ~1;
-              this.regs[2] = 1;
-            } else if (a0 === 2) {
-              // ExitCriticalSection: enable interrupts, return 1 in $v0
-              this.cop0Regs[12] |= 1;
-              this.regs[2] = 1;
-            } else if (a0 === 3) {
-              // ChangeThreadSubFunction
-              this.regs[2] = 0;
-            } else {
-              this.regs[2] = 1;
+          if (!hasInstalledVector && this.hleBiosEnabled) {
+            // Clean HLE fallback ONLY when running in Direct HLE mode (Branch B)
+            const res = HleBiosDispatcher.dispatchSyscall(this, this.memory, currentPc);
+            const logMsg = `[HLE SYSCALL] Code 0x${res.fnId.toString(16).toUpperCase()} (${res.serviceName}) from ${res.sourceReg}=0x${res.fnId.toString(16).toUpperCase()} -> $v0=0x${this.regs[2].toString(16).toUpperCase()}`;
+            if (this.memory.onLog) {
+              this.memory.onLog('bios', logMsg, currentPc);
             }
 
-            // Advance PC past the SYSCALL instruction
-            this.epc = currentPc >>> 0;
+            // Advance PC past the SYSCALL instruction and increment EPC to avoid infinite exception loop
+            this.epc = (currentPc + 4) >>> 0;
             this.cop0Regs[14] = (currentPc + 4) >>> 0;
             this.pc = (currentPc + 4) >>> 0;
             this.nextPc = (this.pc + 4) >>> 0;
             this.inDelaySlot = false;
             this.branchPending = false;
             this.exceptionTriggeredInStep = true;
+            this.executeRfe();
             break;
           }
 
@@ -1358,7 +1697,7 @@ export class Cpu {
           const bev = (this.cop0Regs[12] & (1 << 22)) !== 0;
           const targetVector = bev ? 0xbfc00180 : 0x80000080;
           const vectorFirstInstr = this.memory.read32(targetVector);
-          const hasInstalledVector = vectorFirstInstr !== 0 && vectorFirstInstr !== 0xffffffff;
+          const hasInstalledVector = bev || (vectorFirstInstr !== 0 && vectorFirstInstr !== 0xffffffff && vectorFirstInstr !== 0x401a7000);
 
           if (!hasInstalledVector) {
             if (this.memory.onLog) {

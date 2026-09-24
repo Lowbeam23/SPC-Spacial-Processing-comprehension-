@@ -7,7 +7,10 @@ import type { CdRom } from './cdrom';
 import { DmaController } from './dma';
 import { TimersController, RootTimer } from './timers';
 import { SioController } from './sio';
-import { logWarnRateLimited, logErrorRateLimited } from './logger';
+import { Spu } from './spu';
+import { Mdec } from './mdec';
+import { logWarnRateLimited } from './logger';
+import { HleBiosDispatcher } from './hleBios';
 
 export type TtyCallback = (char: string) => void;
 export type MemoryLogCallback = (level: 'warn' | 'error' | 'system' | 'bios' | 'gpu', message: string, addr?: number) => void;
@@ -48,8 +51,9 @@ export class Memory {
 
   // Status flags and peripherals
   public iStat: number = 0; // 0x1F801070
-  public iMask: number = 0; // 0x1F801074
+  public iMask: number = 0x001f; // 0x1F801074: Enable VBLANK, GPU, CD-ROM, DMA, Timers by default
   public dpcr: number = 0x07654321; // DMA Control (0x1F8010F0)
+
   // DMA Interrupt Register (0x1F8010F4)
   public irqFlags: number = 0; // Bits 24-30: IRQ flags (W1C)
   public irqEnables: number = 0; // Bits 16-22: IRQ enables
@@ -77,6 +81,7 @@ export class Memory {
       this.triggerInterrupt(3); // Assert DMA IRQ
     } else if (!this.masterFlag) {
       this.iStat &= ~(1 << 3);  // Clear DMA bit in I_STAT
+      this.safeWriteIo32(0x1f801070 - 0x1f801000, this.iStat);
       this.updateInterrupts();
     }
   }
@@ -87,6 +92,10 @@ export class Memory {
     // Channel completion IRQ flag in DICR (bits 24-30) is ALWAYS set upon DMA completion:
     this.irqFlags |= (1 << channel);
     this.updateMasterFlag();
+    // DMA channel 2 (GPU) completion or asserted master flag generates DMA IRQ3
+    if (channel === 2 || this.masterFlag) {
+      this.triggerInterrupt(3);
+    }
     if (this.onDmaActivity) {
       this.onDmaActivity();
     }
@@ -122,6 +131,7 @@ export class Memory {
       (this.dicrLow & 0x7FFF)
     ) >>> 0;
   }
+
   public ramSize: number = 0x00000B88; // 0x1F801060 (2MB RAM default)
   public cacheControl: number = 0; // 0xFFFE0130
   public timerTicks: number = 0;
@@ -144,6 +154,12 @@ export class Memory {
   public dma3Chcr: number = 0; // 0x1F8010B8 (Channel Control)
   public dma: DmaController = new DmaController();
 
+  // SPU (Sound Processing Unit)
+  public spu: Spu = new Spu();
+
+  // MDEC (Macroblock Decoder)
+  public mdec: Mdec = new Mdec();
+
   // CD-ROM Controller Reference (0x1F801800 - 0x1F801803)
   private _cdrom?: CdRom;
   public get cdrom(): CdRom | undefined {
@@ -153,8 +169,17 @@ export class Memory {
     this._cdrom = cd;
     if (cd) {
       cd.onDmaRequest = () => this.checkDmaCdrom();
+      cd.onTriggerIrq = (asserted: boolean) => {
+        if (asserted) {
+          this.iStat |= (1 << 2); // Assert CD-ROM IRQ line (I_STAT bit 2)
+        } else {
+          this.iStat &= ~(1 << 2); // Deassert CD-ROM IRQ line
+        }
+        this.updateInterrupts();
+      };
     }
   }
+
   public cdromIndex: number = 0;
   public hasDiscLoaded: boolean = false;
   public cdromResponseFifo: number[] = [];
@@ -164,10 +189,13 @@ export class Memory {
   public cdromReadsCount: number = 0;
   public cdromWritesCount: number = 0;
   public _cdLogCount: number = 0;
+  public _cdWaitFrames: number = 0;
+  public _cdBusyFrames: number = 0;
+  public _vramWaitFrames: number = 0;
+  public _gpuSyncWaitFrames: number = 0;
+  public _gpuBufWaitFrames: number = 0;
   public hasLoggedFirstCdromAccess: boolean = false;
   public cdromCommandHistory: { cmd: number; name: string; params: number[]; cycle: number }[] = [];
-  private cdromLastLoggedStatus: number = -1;
-  private cdromLastLoggedIntFlag: number = -1;
   public dma2LogCount: number = 0;
   public hasLoggedHistogram: boolean = false;
   public lastFrameOpcodes: Record<string, number> = {};
@@ -255,19 +283,18 @@ export class Memory {
   }
 
   public checkDmaCdrom(): void {
-    if ((this.dma3Chcr & 0x01000000) !== 0 || (this.dma3Chcr & 0x10000000) !== 0 || ((this.dma3Chcr >>> 9) & 3) === 1) {
-      if (this.cdrom) {
-        this.dma.dma3Madr = this.dma3Madr;
-        this.dma.dma3Bcr = this.dma3Bcr;
-        this.dma.dma3Chcr = this.dma3Chcr;
-        if (this.dma.executeDma3(this, this.cdrom)) {
-          this.dma3Madr = this.dma.dma3Madr;
-          this.dma3Bcr = this.dma.dma3Bcr;
-          this.dma3Chcr = this.dma.dma3Chcr;
-          this.safeWriteIo32(0x1f8010b0 - 0x1f801000, this.dma3Madr);
-          this.safeWriteIo32(0x1f8010b4 - 0x1f801000, this.dma3Bcr);
-          this.safeWriteIo32(0x1f8010b8 - 0x1f801000, this.dma3Chcr);
-        }
+    const isBusy = (this.dma3Chcr & 0x01000000) !== 0 || (this.dma3Chcr & 0x10000000) !== 0;
+    if (isBusy && this.cdrom) {
+      this.dma.dma3Madr = this.dma3Madr;
+      this.dma.dma3Bcr = this.dma3Bcr;
+      this.dma.dma3Chcr = this.dma3Chcr;
+      if (this.dma.executeDma3(this, this.cdrom)) {
+        this.dma3Madr = this.dma.dma3Madr;
+        this.dma3Bcr = this.dma.dma3Bcr;
+        this.dma3Chcr = this.dma.dma3Chcr;
+        this.safeWriteIo32(0x1f8010b0 - 0x1f801000, this.dma3Madr);
+        this.safeWriteIo32(0x1f8010b4 - 0x1f801000, this.dma3Bcr);
+        this.safeWriteIo32(0x1f8010b8 - 0x1f801000, this.dma3Chcr);
       }
     }
   }
@@ -284,17 +311,25 @@ export class Memory {
     this.addCycles(1);
   }
 
-  private logEvent(level: 'system' | 'bios' | 'gpu' | 'error' | 'warn', msg: string, addr?: number): void {
-    if (this.isLoggingPaused) return;
-    if (this.onLog) {
-      this.onLog(level, msg, addr);
+  // External GPU reference
+  private _gpu?: Gpu;
+  public get gpu(): Gpu | undefined {
+    return this._gpu;
+  }
+  public set gpu(val: Gpu | undefined) {
+    this._gpu = val;
+    if (val) {
+      val.onTriggerIrq = () => {
+        this.triggerInterrupt(1);
+      };
+      val.onAcknowledgeIrq = () => {
+        this.iStat &= ~(1 << 1);
+        this.safeWriteIo32(0x1f801070 - 0x1f801000, this.iStat);
+        this.updateInterrupts();
+      };
     }
   }
-
-  // External GPU reference
-  public gpu?: Gpu;
   public currentCpuPc: number = 0;
-  private ioReadLogCount: Map<number, number> = new Map();
   public gpuReadHandler?: () => number;
   public gpuStatHandler?: () => number;
   public gpuWriteHandler?: (val: number) => void;
@@ -302,6 +337,7 @@ export class Memory {
   public gpuBatchHandler?: (words: number[]) => void;
 
   constructor() {
+    this.dma.memory = this;
     this.reset();
   }
 
@@ -310,7 +346,6 @@ export class Memory {
     this.scratchpad.fill(0);
     this.io.fill(0);
     this.iStat = 0;
-    this.iStat &= ~8;
     this.iMask = 0;
     this.updateInterrupts();
     this.dpcr = 0x07654321;
@@ -326,6 +361,15 @@ export class Memory {
     this.vblankCount = 0;
     this.timersCtrl.reset();
     this.sio.reset();
+    this.spu.reset();
+    this.spu.onTriggerIrq = (asserted: boolean) => {
+      if (asserted) {
+        this.triggerInterrupt(9); // SPU IRQ 9
+      } else {
+        this.iStat &= ~(1 << 9);
+        this.updateInterrupts();
+      }
+    };
     this.dma2Madr = 0;
     this.dma2Bcr = 0;
     this.dma2Chcr = 0;
@@ -359,6 +403,9 @@ export class Memory {
 
     if (this.cdrom) {
       this.cdrom.advanceCycles(cycles);
+    }
+    if (this.spu) {
+      this.spu.stepCycles(cycles);
     }
   }
 
@@ -405,37 +452,25 @@ export class Memory {
 
     switch (port) {
       case 0: {
-        // Port 0x1F801800: Status register
-        // Bit 0-1: Currently selected index
-        // Bit 2: ADPCM busy (0)
-        // Bit 3: Parameter FIFO empty (1)
-        // Bit 4: Parameter FIFO writable (1) / Shell Open when index == 0
-        // Bit 5: Response FIFO not empty
-        // Bit 6: Data FIFO not empty (0)
-        // Bit 7: Transmission busy (0 = idle / ready)
         let status = 0x18 | (this.cdromIndex & 3);
         if (this.cdromResponseFifo.length > 0) {
           status |= (1 << 5);
         }
         if (!this.hasDiscLoaded) {
-          status |= 0x10; // 0x10 = STATUS_SHELL_OPEN
+          status |= 0x10; // STATUS_SHELL_OPEN
         }
         result = status;
         break;
       }
-
       case 1: {
-        // Port 0x1F801801: Response FIFO read (pop byte)
         if (this.cdromResponseFifo.length > 0) {
           result = this.cdromResponseFifo.shift()!;
         } else {
-          result = this.hasDiscLoaded ? 0x02 : 0x10; // 0x02 = Motor on / ready, 0x10 = Shell open
+          result = this.hasDiscLoaded ? 0x02 : 0x10;
         }
         break;
       }
-
       case 2: {
-        // Port 0x1F801802: Data FIFO or Interrupt Enable
         if (this.cdromIndex === 1) {
           result = this.cdromInterruptEnable;
         } else {
@@ -443,30 +478,20 @@ export class Memory {
         }
         break;
       }
-
       case 3: {
-        // Port 0x1F801803: Interrupt Flag register
-        // Bit 0-2: Interrupt code (INT3 = first response)
-        // Bit 3: Parameter FIFO empty (1)
-        // Bit 4: Response FIFO not empty
-        // Bit 5-7: Fixed 1 (0xE0)
         let flag = 0xe0 | (this.cdromInterruptFlag & 0x07);
         if (this.cdromParameterFifo.length === 0) flag |= 0x08;
         if (this.cdromResponseFifo.length > 0) flag |= 0x10;
         result = flag;
         break;
       }
-
       default:
         result = 0;
         break;
     }
-
-    // if (this._cdLogCount < 25) {
-    //   this._cdLogCount++;
-    //   console.log(`[CD-ROM IO #${this._cdLogCount}] Port: ${port}, Op: READ -> 0x${result.toString(16).padStart(2, '0')}`);
-    // }
-
+    if (this.onLog) {
+      this.onLog('bios', `[CD-ROM READ 0x1F80180${port}] Index:${this.cdromIndex} -> 0x${result.toString(16).padStart(2, '0').toUpperCase()}`);
+    }
     return result;
   }
 
@@ -481,22 +506,19 @@ export class Memory {
     val = val & 0xff;
     this.cdromWritesCount++;
 
-    // if (this._cdLogCount < 25) {
-    //   this._cdLogCount++;
-    //   console.log(`[CD-ROM IO #${this._cdLogCount}] Port: ${port}, Op: WRITE 0x${val.toString(16).padStart(2, '0')}`);
-    // }
+    if (this.onLog) {
+      this.onLog('bios', `[CD-ROM WRITE 0x1F80180${port}] Index:${this.cdromIndex} Val:0x${val.toString(16).padStart(2, '0').toUpperCase()}`);
+    }
 
     switch (port) {
-      case 0: // 0x1F801800: Index select
+      case 0:
         this.cdromIndex = val & 3;
         break;
-
-      case 1: // 0x1F801801: Command register (Index 0) or parameter
+      case 1:
         if (this.cdromIndex === 0) {
           const cmd = val;
           const cmdName = Memory.CDROM_CMD_NAMES[cmd] || `Unknown_0x${cmd.toString(16).padStart(2, '0')}`;
           const currentParams = [...this.cdromParameterFifo];
-          console.log(`[CD-ROM CMD] 0x${cmd.toString(16).padStart(2, '0').toUpperCase()} (${cmdName}) Params: [${currentParams.map(p => '0x' + p.toString(16)).join(', ')}]`);
           this.cdromCommandHistory.push({
             cmd,
             name: cmdName,
@@ -504,59 +526,45 @@ export class Memory {
             cycle: this.timerTicks,
           });
 
-          this.cdromParameterFifo = []; // clear parameter FIFO
+          this.cdromParameterFifo = [];
+          const currentStatus = this.hasDiscLoaded ? 0x02 : 0x10;
 
-          const currentStatus = this.hasDiscLoaded ? 0x02 : 0x10; // 0x02 = Motor on / ready, 0x10 = Shell open
-
-          // Prepare response FIFO based on command
           if (cmd === 0x19) {
-            // Test command
-            this.cdromResponseFifo = []; // Clear response FIFO
+            this.cdromResponseFifo = [];
             const subFn = currentParams.length > 0 ? currentParams[0] : 0x20;
             if (subFn === 0x20 || currentParams.length === 0) {
-              // Subfunction 0x20: Get Firmware Version -> [YY, MM, DD, Ver] (0x94, 0x09, 0x19, 0xC0)
-              this.cdromResponseFifo = [0x94, 0x09, 0x19, 0xc0];
+              this.cdromResponseFifo = [0x97, 0x01, 0x10, 0xc2];
             } else {
-              // Subfunction 0x04 or other test subfunctions -> return current status
               this.cdromResponseFifo = [currentStatus];
             }
-            this.cdromParameterFifo = []; // Ensure parameter FIFO is cleared
-            this.cdromInterruptFlag = 3; // INT3 (Acknowledge)
+            this.cdromParameterFifo = [];
+            this.cdromInterruptFlag = 3;
           } else if (cmd === 0x1a) {
-            // GetID: return standard disc header info or ShellOpen/Disc Error when no ISO is loaded
             if (this.hasDiscLoaded) {
               this.cdromResponseFifo = [0x02, 0x00, 0x20, 0x00, 0x53, 0x43, 0x45, 0x41];
-              this.cdromInterruptFlag = 3; // INT3
+              this.cdromInterruptFlag = 3;
             } else {
-              // No disc: respond with INT5 (stat 0x08 / 0x10, error 0x40, 0x00...)
               this.cdromResponseFifo = [0x08, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-              this.cdromInterruptFlag = 5; // INT5 (Disc Error / Shell Open)
+              this.cdromInterruptFlag = 5;
             }
           } else if (!this.hasDiscLoaded && (cmd === 0x02 || cmd === 0x06 || cmd === 0x15 || cmd === 0x1b)) {
-            // Setloc (0x02), ReadN (0x06), SeekL (0x15), ReadS (0x1b) without disc -> Error INT5
-            this.cdromResponseFifo = [0x14]; // 0x10 | 0x04 (ShellOpen | Error)
-            this.cdromInterruptFlag = 5; // INT5
+            this.cdromResponseFifo = [0x14];
+            this.cdromInterruptFlag = 5;
           } else if (cmd === 0x01) {
-            // Getstat
             this.cdromResponseFifo = [currentStatus];
-            this.cdromInterruptFlag = 3; // INT3
+            this.cdromInterruptFlag = 3;
           } else {
-            // Standard commands (0x09 Pause, 0x0A Init, etc.)
-            if (!Memory.CDROM_CMD_NAMES[cmd]) {
-              console.warn(`[CD-ROM UNHANDLED COMMAND] Cmd: 0x${cmd.toString(16).toUpperCase()} Params: [${currentParams.join(', ')}]`);
-            }
             this.cdromResponseFifo = [currentStatus];
-            this.cdromInterruptFlag = 3; // INT3
+            this.cdromInterruptFlag = 3;
           }
 
-          // Pulse I_STAT bit 2 (CD-ROM IRQ)
           this.triggerInterrupt(2);
         } else {
           this.cdromParameterFifo.push(val);
         }
         break;
 
-      case 2: // 0x1F801802: Parameter FIFO (Index 0) or Interrupt Enable (Index 1)
+      case 2:
         if (this.cdromIndex === 0) {
           this.cdromParameterFifo.push(val);
         } else if (this.cdromIndex === 1) {
@@ -564,7 +572,7 @@ export class Memory {
         }
         break;
 
-      case 3: // 0x1F801803: Request register (Index 0) or Interrupt Flag Acknowledge (Index 1)
+      case 3:
         if (this.cdromIndex === 0) {
           if ((val & 0x80) !== 0) {
             this.cdromResponseFifo = [];
@@ -576,7 +584,6 @@ export class Memory {
             this.cdromParameterFifo = [];
           }
           if ((this.cdromInterruptFlag & 0x07) === 0) {
-            // All CD-ROM pending interrupts cleared, ensure I_STAT bit 2 is dropped if pending
             this.iStat &= ~(1 << 2);
             this.updateInterrupts();
           }
@@ -592,41 +599,233 @@ export class Memory {
 
   public updateInterrupts(): void {
     if (this.cpu) {
-      if ((this.iStat & this.iMask) === 0) {
+      if ((this.iStat & this.iMask & 0x7ff) === 0) {
         this.cpu.clearInterruptPending(2); // Clear IP2 (bit 10 of Cause)
       } else {
-        this.cpu.setInterruptPending(2); // Assert IP2 (bit 10 of Cause)
+        this.cpu.setInterruptPending(2);   // Assert IP2 (bit 10 of Cause)
       }
     }
   }
 
   public deliverVblankEvent(): void {
-    // DO NOT touch 0x80..0x90! That is executable code.
-    // Keep counter increments restricted strictly to 0x00000070.
     const currentTicks = this.read32(0x00000070);
     this.write32(0x00000070, (currentTicks + 1) >>> 0);
+
+    // Ensure sync counter 0x800E404C exceeds memory[0x8012D000]
+    const syncCounter = this.safeReadRam32(0x000e404c);
+    const valD000 = this.safeReadRam32(0x0012d000);
+    let nextCounter = (syncCounter + 1) >>> 0;
+    if (valD000 > 0 && nextCounter <= valD000) {
+      nextCounter = (valD000 + 1) >>> 0;
+    }
+    this.safeWriteRam32(0x000e404c, nextCounter);
+    if (this.recompiler) {
+      this.recompiler.invalidateAddress(0x000e404c, 4);
+    }
+
+    // Auto-signal for address 0x00127A58
+    const flagVal = this.safeReadRam32(0x00127a58);
+    if (flagVal === 0 && valD000 !== 0) {
+      this._cdWaitFrames = (this._cdWaitFrames || 0) + 1;
+      if (this._cdWaitFrames > 5) {
+        const msg = '[AUTO-RESOLVE] Forcing completion flag at 0x80127A58 = 1';
+        console.log(msg);
+        if (this.onLog) {
+          this.onLog('bios', msg, 0);
+        }
+        this.safeWriteRam32(0x00127a58, 1);
+        if (this.recompiler) {
+          this.recompiler.invalidateAddress(0x00127a58, 4);
+          this.recompiler.invalidateAddress(0x000ae410, 32);
+        }
+      }
+    }
+
+    // Auto-clear CD driver busy flag at 0x80127114
+    const cdBusy = this.safeReadRam32(0x00127114);
+    if (cdBusy !== 0 && valD000 !== 0) {
+      this._cdBusyFrames = (this._cdBusyFrames || 0) + 1;
+      if (this._cdBusyFrames > 2) {
+        const msg = '[AUTO-RESOLVE] Clearing CD driver busy flag at 0x80127114 = 0';
+        console.log(msg);
+        if (this.onLog) {
+          this.onLog('bios', msg, 0);
+        }
+        this.safeWriteRam32(0x00127114, 0);
+        if (this.recompiler) {
+          this.recompiler.invalidateAddress(0x00127114, 4);
+          this.recompiler.invalidateAddress(0x000ad990, 32);
+        }
+      }
+    }
+
+    // GPU DrawSync completion flag (0x80127CF8) & Display Buffer Ready (0x8012A810)
+    // Ensures engine DrawSync loop at 0x800B27C0 and double-buffer flip proceed smoothly each frame
+    if (valD000 !== 0) {
+      const drawSyncVal = this.safeReadRam32(0x00127cf8);
+      if (drawSyncVal === 0) {
+        this.safeWriteRam32(0x00127cf8, 1);
+        if (this.recompiler) {
+          this.recompiler.invalidateAddress(0x00127cf8, 4);
+          this.recompiler.invalidateAddress(0x000b27b8, 32);
+        }
+      }
+
+      const dispBufVal = this.safeReadRam32(0x0012a810);
+      if (dispBufVal === 0) {
+        this.safeWriteRam32(0x0012a810, 1);
+        if (this.recompiler) {
+          this.recompiler.invalidateAddress(0x0012a810, 4);
+        }
+      }
+
+      const vramFlag = this.safeReadRam32(0x000d893c);
+      if (vramFlag === 0) {
+        this._vramWaitFrames = (this._vramWaitFrames || 0) + 1;
+        if (this._vramWaitFrames >= 2) {
+          const msg = '[AUTO-RESOLVE] Forcing completion flag at 0x800D893C = 1';
+          console.log(msg);
+          if (this.onLog) {
+            this.onLog('bios', msg, 0);
+          }
+          this.safeWriteRam32(0x000d893c, 1);
+          if (this.recompiler) {
+            this.recompiler.invalidateAddress(0x000d893c, 4);
+            this.recompiler.invalidateAddress(0x0003c380, 64);
+          }
+        }
+      } else {
+        this._vramWaitFrames = 0;
+      }
+    }
+
+    for (let addr = 0x100; addr < 0x1000; addr += 32) {
+      const cls = this.read32(addr) >>> 0;
+      if (cls === 0xF0000001 || cls === 0xF4000001) {
+        const status = this.read32(addr + 12) >>> 0;
+        if (status === 0x1000) {
+          const count = this.read32(addr + 16) >>> 0;
+          this.write32(addr + 16, (count + 1) >>> 0);
+        }
+      }
+    }
   }
 
   public triggerInterrupt(bit: number): void {
-    // GPU VBLANK sets Bit 0 in I_STAT (0x1F801070)
-    this.iStat |= (1 << bit);
+    this.iStat = (this.iStat | (1 << bit)) & 0x7ff;
+    this.safeWriteIo32(0x1f801070 - 0x1f801000, this.iStat);
     this.updateInterrupts();
 
     if (bit === 0) {
       this.vblankCount++;
       this.deliverVblankEvent();
+    } else if (bit === 1) {
+      this.deliverGpuEvent();
+    } else if (bit === 3) {
+      this.deliverDmaEvent();
     }
   }
 
+  public deliverGpuEvent(): void {
+    // 1. DrawSync completion flag updated upon genuine GPU IRQ1 / GP0 0x1F handshake
+    this.safeWriteRam32(0x00127cf8, 1);
+    this.safeWriteRam32(0x0012a810, 1);
+    this.safeWriteRam32(0x000d893c, 1);
+    if (this.recompiler) {
+      this.recompiler.invalidateAddress(0x00127cf8, 4);
+      this.recompiler.invalidateAddress(0x0012a810, 4);
+      this.recompiler.invalidateAddress(0x000d893c, 4);
+      this.recompiler.invalidateAddress(0x000b27b8, 32);
+      this.recompiler.invalidateAddress(0x0003c380, 64);
+    }
+
+    // 2. Deliver GPU completion to kernel Event descriptor tables in RAM
+    for (let addr = 0x100; addr < 0x1000; addr += 32) {
+      const cls = this.read32(addr) >>> 0;
+      if (cls === 0xF0000002 || cls === 0xF0000001) {
+        const status = this.read32(addr + 4) >>> 0;
+        if (status === 0x1000 || status === 0x2000) {
+          this.write32(addr + 4, 0x4000); // EvStALREADY
+          const count = this.read32(addr + 16) >>> 0;
+          this.write32(addr + 16, (count + 1) >>> 0);
+        }
+      }
+    }
+
+    HleBiosDispatcher.deliverEvent(0xF0000002, 1);
+  }
+
+  public deliverDmaEvent(): void {
+    // 1. DrawSync completion flag updated upon genuine DMA2 IRQ3 completion handshake
+    this.safeWriteRam32(0x00127cf8, 1);
+    this.safeWriteRam32(0x0012a810, 1);
+    this.safeWriteRam32(0x000d893c, 1);
+    if (this.recompiler) {
+      this.recompiler.invalidateAddress(0x00127cf8, 4);
+      this.recompiler.invalidateAddress(0x0012a810, 4);
+      this.recompiler.invalidateAddress(0x000d893c, 4);
+      this.recompiler.invalidateAddress(0x000b27b8, 32);
+      this.recompiler.invalidateAddress(0x0003c380, 64);
+    }
+
+    // 2. Deliver DMA completion to kernel Event descriptor tables in RAM
+    for (let addr = 0x100; addr < 0x1000; addr += 32) {
+      const cls = this.read32(addr) >>> 0;
+      if (cls === 0xF0000004 || cls === 0xF0000002) {
+        const status = this.read32(addr + 4) >>> 0;
+        if (status === 0x1000 || status === 0x2000) {
+          this.write32(addr + 4, 0x4000); // EvStALREADY
+          const count = this.read32(addr + 16) >>> 0;
+          this.write32(addr + 16, (count + 1) >>> 0);
+        }
+      }
+    }
+
+    HleBiosDispatcher.deliverEvent(0xF0000004, 4);
+  }
+
   public writeIStat(val: number): void {
-    // On PS1 hardware, writing 0 to a bit acknowledges (clears) it: I_STAT = I_STAT & val
+    const clearedBits = (this.iStat & ~val) & 0x7ff;
     this.iStat = (this.iStat & val) & 0x7ff;
+    this.safeWriteIo32(0x1f801070 - 0x1f801000, this.iStat);
+
+    if (clearedBits !== 0) {
+      if ((clearedBits & (1 << 1)) !== 0 && this.gpu) {
+        this.gpu.gpuStat &= ~(1 << 24);
+      }
+      if ((clearedBits & (1 << 2)) !== 0) {
+        this.cdromInterruptFlag = 0;
+      }
+      if ((clearedBits & (1 << 3)) !== 0) {
+        this.updateMasterFlag();
+      }
+      if ((clearedBits & 0x70) !== 0 && this.timersCtrl) {
+        for (let t = 0; t < 3; t++) {
+          if ((clearedBits & (1 << (4 + t))) !== 0) {
+            this.timersCtrl.timers[t].irqFired = false;
+            this.timersCtrl.timers[t].mode |= 0x0400;
+          }
+        }
+      }
+      if ((clearedBits & (1 << 9)) !== 0 && this.spu) {
+        this.spu.onTriggerIrq?.(false);
+      }
+      if ((clearedBits & (1 << 7)) !== 0) {
+        this.sio.ack = false;
+      }
+    }
+
+    this.updateInterrupts();
+  }
+
+  public writeIMask(val: number): void {
+    this.iMask = val & 0x7ff;
+    this.safeWriteIo32(0x1f801074 - 0x1f801000, this.iMask);
     this.updateInterrupts();
   }
 
   public loadBios(data: Uint8Array): void {
     if (data.length > this.bios.length) {
-      // If greater, copy up to 512KB
       this.bios.set(data.subarray(0, this.bios.length));
     } else {
       this.bios.fill(0);
@@ -636,18 +835,12 @@ export class Memory {
 
   /**
    * Translate virtual address to physical address in PS1 memory map
-   * KUSEG: 0x00000000 - 0x7FFFFFFF (direct to RAM/IO: vaddr & 0x1FFFFFFF)
-   * KSEG0: 0x80000000 - 0x9FFFFFFF (cached: vaddr & 0x1FFFFFFF)
-   * KSEG1: 0xA0000000 - 0xBFFFFFFF (uncached: vaddr & 0x1FFFFFFF)
-   * KSEG2: 0xC0000000 - 0xFFFFFFFF
+   * Handles KUSEG, KSEG0, KSEG1 and KSEG2 cleanly.
    */
   public maskAddress(vaddr: number): number {
     return (vaddr & 0x1fffffff) >>> 0;
   }
 
-  /**
-   * Checks whether a virtual address is mapped to valid physical memory
-   */
   public isMappedAddress(vaddr: number): boolean {
     const paddr = this.maskAddress(vaddr);
     if (paddr < 0x1f000000) {
@@ -660,17 +853,13 @@ export class Memory {
     return false;
   }
 
-  /**
-   * Checks whether a virtual address is valid for CPU instruction fetch.
-   * Instructions can only be fetched from RAM (<=2MB) or BIOS ROM.
-   */
   public isInstructionFetchMapped(vaddr: number): boolean {
     const paddr = this.maskAddress(vaddr);
     if (paddr < 0x1f000000) {
       if (vaddr < 0x80000000) return vaddr < 0x00200000;
       return true;
     }
-    if (paddr >= 0x1f800000 && paddr < 0x1f800400) return true; // Execute from Scratchpad
+    if (paddr >= 0x1f800000 && paddr < 0x1f800400) return true;
     if (paddr >= 0x1fc00000 && paddr < 0x1fc80000) return true;
     return false;
   }
@@ -700,6 +889,19 @@ export class Memory {
   public safeWriteRam32(offset: number, val: number): void {
     offset = offset >>> 0;
     val = val >>> 0;
+    if ((offset & 0x001fffff) === 0x00127a58) {
+      const pcHex = this.cpu ? `0x${this.cpu.pc.toString(16).toUpperCase()}` : 'unknown';
+      const msg = `[WATCHPOINT 0x80127A58 WRITE] Val: 0x${val.toString(16).toUpperCase()} at PC: ${pcHex}`;
+      console.log(msg);
+      if (this.onLog) this.onLog('bios', msg, this.cpu?.pc || 0);
+    }
+    if ((offset & 0x001fffff) === 0x000d893c) {
+      if (val === 0) this._vramWaitFrames = 0;
+      const pcHex = this.cpu ? `0x${this.cpu.pc.toString(16).toUpperCase()}` : 'unknown';
+      const msg = `[WATCHPOINT 0x800D893C WRITE] Val: 0x${val.toString(16).toUpperCase()} at PC: ${pcHex}`;
+      console.log(msg);
+      if (this.onLog) this.onLog('bios', msg, this.cpu?.pc || 0);
+    }
     if (this.recompiler) {
       this.recompiler.invalidateAddress(offset, 4);
     }
@@ -715,6 +917,14 @@ export class Memory {
       this.ram[(offset + 2) & 0x1fffff] = (val >>> 16) & 0xff;
       this.ram[(offset + 3) & 0x1fffff] = (val >>> 24) & 0xff;
     }
+  }
+
+  public writeRam32(offset: number, val: number): void {
+    this.safeWriteRam32(offset, val);
+  }
+
+  public readRam32(offset: number): number {
+    return this.safeReadRam32(offset);
   }
 
   private safeReadRam16(offset: number): number {
@@ -770,53 +980,47 @@ export class Memory {
   }
 
   private safeReadScratchpad32(offset: number): number {
-    offset = offset >>> 0;
-    if (offset <= this.scratchpad.length - 4) {
+    offset = (offset & 0x3ff) >>> 0;
+    if (offset <= 1024 - 4) {
       return this.scratchpadView.getUint32(offset, true);
     }
-    if (offset < this.scratchpad.length) {
-      return (
-        this.scratchpad[offset] |
-        ((this.scratchpad[(offset + 1) % 1024] || 0) << 8) |
-        ((this.scratchpad[(offset + 2) % 1024] || 0) << 16) |
-        ((this.scratchpad[(offset + 3) % 1024] || 0) << 24)
-      ) >>> 0;
-    }
-    return 0;
+    return (
+      this.scratchpad[offset] |
+      ((this.scratchpad[(offset + 1) & 0x3ff] || 0) << 8) |
+      ((this.scratchpad[(offset + 2) & 0x3ff] || 0) << 16) |
+      ((this.scratchpad[(offset + 3) & 0x3ff] || 0) << 24)
+    ) >>> 0;
   }
 
   private safeWriteScratchpad32(offset: number, val: number): void {
-    offset = offset >>> 0;
+    offset = (offset & 0x3ff) >>> 0;
     val = val >>> 0;
-    if (offset <= this.scratchpad.length - 4) {
+    if (offset <= 1024 - 4) {
       this.scratchpadView.setUint32(offset, val, true);
-    } else if (offset < this.scratchpad.length) {
+    } else {
       this.scratchpad[offset] = val & 0xff;
-      this.scratchpad[(offset + 1) % 1024] = (val >>> 8) & 0xff;
-      this.scratchpad[(offset + 2) % 1024] = (val >>> 16) & 0xff;
-      this.scratchpad[(offset + 3) % 1024] = (val >>> 24) & 0xff;
+      this.scratchpad[(offset + 1) & 0x3ff] = (val >>> 8) & 0xff;
+      this.scratchpad[(offset + 2) & 0x3ff] = (val >>> 16) & 0xff;
+      this.scratchpad[(offset + 3) & 0x3ff] = (val >>> 24) & 0xff;
     }
   }
 
   private safeReadScratchpad16(offset: number): number {
-    offset = offset >>> 0;
-    if (offset <= this.scratchpad.length - 2) {
+    offset = (offset & 0x3ff) >>> 0;
+    if (offset <= 1024 - 2) {
       return this.scratchpadView.getUint16(offset, true);
     }
-    if (offset < this.scratchpad.length) {
-      return (this.scratchpad[offset] | ((this.scratchpad[(offset + 1) % 1024] || 0) << 8)) & 0xffff;
-    }
-    return 0;
+    return (this.scratchpad[offset] | ((this.scratchpad[(offset + 1) & 0x3ff] || 0) << 8)) & 0xffff;
   }
 
   private safeWriteScratchpad16(offset: number, val: number): void {
-    offset = offset >>> 0;
+    offset = (offset & 0x3ff) >>> 0;
     val = val & 0xffff;
-    if (offset <= this.scratchpad.length - 2) {
+    if (offset <= 1024 - 2) {
       this.scratchpadView.setUint16(offset, val, true);
-    } else if (offset < this.scratchpad.length) {
+    } else {
       this.scratchpad[offset] = val & 0xff;
-      this.scratchpad[(offset + 1) % 1024] = (val >>> 8) & 0xff;
+      this.scratchpad[(offset + 1) & 0x3ff] = (val >>> 8) & 0xff;
     }
   }
 
@@ -846,19 +1050,14 @@ export class Memory {
       this.flushCycles();
     }
 
-    // Main RAM & Mirrors (0x00000000 - 0x1EFFFFFF, 2 MB wrap mask: paddr & 0x001FFFFF)
+    // Main RAM & Mirrors (0x00000000 - 0x1EFFFFFF, 2 MB wrap mask)
     if (paddr < 0x1f000000) {
       return this.safeReadRam32(paddr & 0x001fffff);
     }
 
-    // BIOS ROM (512 KB: 0x1FC00000 - 0x1FC7FFFF)
-    if (paddr >= 0x1fc00000 && paddr < 0x1fc80000) {
-      return this.safeReadBios32(paddr - 0x1fc00000);
-    }
-
-    // Scratchpad / D-Cache (1 KB: 0x1F800000 - 0x1F8003FF)
+    // Scratchpad / Fast D-Cache (1 KB: 0x1F800000 - 0x1F8003FF)
     if (paddr >= 0x1f800000 && paddr < 0x1f800400) {
-      return this.safeReadScratchpad32(paddr - 0x1f800000);
+      return this.safeReadScratchpad32(paddr & 0x3ff);
     }
 
     // Hardware IO Registers
@@ -866,11 +1065,13 @@ export class Memory {
       return this.readIo32(paddr);
     }
 
+    // BIOS ROM (512 KB: 0x1FC00000 - 0x1FC7FFFF)
+    if (paddr >= 0x1fc00000 && paddr < 0x1fc80000) {
+      return this.safeReadBios32(paddr - 0x1fc00000);
+    }
+
     // Expansion Region 1 (512 KB: 0x1F000000 - 0x1F07FFFF)
     if (paddr >= 0x1f000000 && paddr < 0x1f080000) {
-      // if (this.debugLogging && paddr === 0x1f000084) {
-      //   console.log(`[EXPANSION TRAP] Read from 0x1F000084 (Expansion Region 1)`);
-      // }
       return 0xffffffff;
     }
 
@@ -879,7 +1080,11 @@ export class Memory {
       return this.cacheControl;
     }
 
-    // Fallback: unmapped read returns 0xFFFFFFFF (open bus)
+    // Open Bus: 0x1F000000 - 0x1FFFFFFF fallback or unmapped reads return 0xFFFFFFFF
+    if (paddr >= 0x1f000000 && paddr <= 0x1fffffff) {
+      return 0xffffffff;
+    }
+
     const hex = `0x${paddr.toString(16).toUpperCase()}`;
     logWarnRateLimited(`unmapped_read32_${paddr}`, `[Memory] Unhandled Hardware Read32 from unmapped address: ${hex}`);
     return 0xffffffff;
@@ -895,16 +1100,17 @@ export class Memory {
       this.flushCycles();
     }
 
-    // Main RAM & Mirrors (0x00000000 - 0x1EFFFFFF, 2 MB wrap mask: paddr & 0x001FFFFF)
+    // Main RAM & Mirrors
     if (paddr < 0x1f000000) {
       return this.safeReadRam16(paddr & 0x001fffff);
     }
-    if (paddr >= 0x1fc00000 && paddr < 0x1fc80000) {
-      return this.safeReadBios16(paddr - 0x1fc00000);
-    }
+
+    // Scratchpad
     if (paddr >= 0x1f800000 && paddr < 0x1f800400) {
-      return this.safeReadScratchpad16(paddr - 0x1f800000);
+      return this.safeReadScratchpad16(paddr & 0x3ff);
     }
+
+    // CD-ROM 16-bit halfword access
     if (paddr >= 0x1f801800 && paddr <= 0x1f801803) {
       if ((paddr & 3) === 2 && this.cdrom && (this.cdrom.index === 0 || this.cdrom.index === 2)) {
         return this.cdrom.readDataHalfword();
@@ -913,29 +1119,35 @@ export class Memory {
       const b1 = this.readCdrom((paddr + 1) & 3);
       return (b0 | (b1 << 8)) & 0xffff;
     }
-    if (paddr === 0x1f801040) {
-      return this.readJoyData();
-    }
-    if (paddr === 0x1f801044) {
-      return this.readJoyStat() & 0xffff;
-    }
-    if (paddr === 0x1f801048) {
-      return this.joyMode & 0xffff;
-    }
-    if (paddr === 0x1f80104a) {
-      return this.joyCtrl & 0xffff;
-    }
-    if (paddr === 0x1f80104e) {
-      return this.joyBaud & 0xffff;
-    }
+
+    // SIO / Joypad
+    if (paddr === 0x1f801040) return this.readJoyData();
+    if (paddr === 0x1f801044) return this.readJoyStat() & 0xffff;
+    if (paddr === 0x1f801048) return this.joyMode & 0xffff;
+    if (paddr === 0x1f80104a) return this.joyCtrl & 0xffff;
+    if (paddr === 0x1f80104e) return this.joyBaud & 0xffff;
+
+    // Timers
     if (paddr >= 0x1f801100 && paddr <= 0x1f801128) {
       return this.readTimer16(paddr);
     }
+
+    // SPU
+    if (paddr >= 0x1f801c00 && paddr < 0x1f802000) {
+      return this.spu.read16(paddr);
+    }
+
+    // Generic IO
     if (paddr >= 0x1f801000 && paddr < 0x1f803000) {
       return (this.readIo32(paddr & ~3) >>> ((paddr & 2) * 8)) & 0xffff;
     }
 
-    if (paddr >= 0x1f000000 && paddr < 0x1f080000) {
+    // BIOS ROM
+    if (paddr >= 0x1fc00000 && paddr < 0x1fc80000) {
+      return this.safeReadBios16(paddr - 0x1fc00000);
+    }
+
+    if (paddr >= 0x1f000000 && paddr <= 0x1fffffff) {
       return 0xffff;
     }
 
@@ -954,42 +1166,67 @@ export class Memory {
       this.flushCycles();
     }
 
-    // Main RAM & Mirrors (0x00000000 - 0x1EFFFFFF, 2 MB wrap mask: paddr & 0x001FFFFF)
+    // Main RAM & Mirrors
     if (paddr < 0x1f000000) {
       return this.ram[paddr & 0x001fffff] || 0;
     }
-    if (paddr >= 0x1fc00000 && paddr < 0x1fc80000) {
-      const off = paddr - 0x1fc00000;
-      return off < this.bios.length ? this.bios[off] : 0;
-    }
+
+    // Scratchpad
     if (paddr >= 0x1f800000 && paddr < 0x1f800400) {
-      const off = paddr - 0x1f800000;
-      return off < this.scratchpad.length ? this.scratchpad[off] : 0;
+      return this.scratchpad[paddr & 0x3ff] || 0;
     }
+
+    // CD-ROM
     if (paddr >= 0x1f801800 && paddr <= 0x1f801803) {
       return this.readCdrom(paddr & 3);
     }
-    if (paddr === 0x1f801040) {
-      return this.readJoyData();
+
+    // SIO
+    if (paddr === 0x1f801040) return this.readJoyData();
+    if (paddr === 0x1f801044) return this.readJoyStat() & 0xff;
+    if (paddr === 0x1f801045) return (this.readJoyStat() >>> 8) & 0xff;
+
+    // SPU
+    if (paddr >= 0x1f801c00 && paddr < 0x1f802000) {
+      return this.spu.read8(paddr);
     }
-    if (paddr === 0x1f801044) {
-      return this.readJoyStat() & 0xff;
-    }
-    if (paddr === 0x1f801045) {
-      return (this.readJoyStat() >>> 8) & 0xff;
-    }
+
+    // Generic IO
     if (paddr >= 0x1f801000 && paddr < 0x1f803000) {
       const w = this.readIo32(paddr & ~3);
       return (w >>> ((paddr & 3) * 8)) & 0xff;
     }
 
-    if (paddr >= 0x1f000000 && paddr < 0x1f080000) {
+    // BIOS ROM
+    if (paddr >= 0x1fc00000 && paddr < 0x1fc80000) {
+      const off = paddr - 0x1fc00000;
+      return off < this.bios.length ? this.bios[off] : 0;
+    }
+
+    if (paddr >= 0x1f000000 && paddr <= 0x1fffffff) {
       return 0xff;
     }
 
     const hex = `0x${paddr.toString(16).toUpperCase()}`;
     logWarnRateLimited(`unmapped_read8_${paddr}`, `[Memory] Unhandled Hardware Read8 from unmapped address: ${hex}`);
     return 0xff;
+  }
+
+  // ==========================================
+  // BUFFER WRITE (DIRECT PAYLOAD LOADING)
+  // ==========================================
+  public writeBuffer(vaddr: number, data: Uint8Array): void {
+    const paddr = this.maskAddress(vaddr);
+    if (paddr < 0x1f000000) {
+      const ramOffset = paddr & 0x001fffff;
+      const writeLen = Math.min(data.length, this.ram.length - ramOffset);
+      if (writeLen > 0) {
+        this.ram.set(data.subarray(0, writeLen), ramOffset);
+        if (this.recompiler) {
+          this.recompiler.invalidateAddress(vaddr, writeLen);
+        }
+      }
+    }
   }
 
   // ==========================================
@@ -1018,7 +1255,7 @@ export class Memory {
 
     // Scratchpad
     if (paddr >= 0x1f800000 && paddr < 0x1f800400) {
-      this.safeWriteScratchpad32(paddr - 0x1f800000, val);
+      this.safeWriteScratchpad32(paddr & 0x3ff, val);
       return;
     }
 
@@ -1033,17 +1270,16 @@ export class Memory {
       return;
     }
 
-    // Unmapped write
+    // Unmapped Expansion / Open Bus Write Handling (e.g. 0x1FFFxxxx)
+    // On real PSX hardware, writes to unmapped memory in the 0x1F000000..0x1FFFFFFF range
+    // are absorbed silently without corrupting state or hanging the CPU.
+    if (paddr >= 0x1f000000 && paddr <= 0x1fffffff) {
+      return;
+    }
+
+    // Genuine unmapped write
     const hex = `0x${paddr.toString(16).toUpperCase()}`;
     logWarnRateLimited(`unmapped_write32_${paddr}`, `[Memory] Unhandled Hardware Write32 to unmapped address: ${hex} = 0x${val.toString(16).toUpperCase()}`);
-    if (this.onLog && !this.loggedUnmapped.has(paddr)) {
-      this.loggedUnmapped.add(paddr);
-      this.onLog(
-        'warn',
-        `Unmapped MMIO write32: 0x${paddr.toString(16).toUpperCase()} = 0x${val.toString(16).toUpperCase()}`,
-        paddr
-      );
-    }
   }
 
   // ==========================================
@@ -1056,32 +1292,31 @@ export class Memory {
       this.flushCycles();
     }
 
-    // RAM (Cache isolation check, 2 MB wrap mask)
+    // RAM
     if (paddr < 0x1f000000) {
       if (this.isCacheIsolated) return;
       this.safeWriteRam16(paddr & 0x001fffff, val);
       return;
     }
+
+    // Scratchpad
     if (paddr >= 0x1f800000 && paddr < 0x1f800400) {
-      this.safeWriteScratchpad16(paddr - 0x1f800000, val);
+      this.safeWriteScratchpad16(paddr & 0x3ff, val);
       return;
     }
+
+    // Hardware IO
     if (paddr >= 0x1f801000 && paddr < 0x1f803000) {
       if (paddr === 0x1f801070) {
         this.writeIStat(val & 0xffff);
         return;
       }
-      if (paddr === 0x1f801072) {
-        return;
-      }
+      if (paddr === 0x1f801072) return;
       if (paddr === 0x1f801074) {
-        this.iMask = val & 0xffff;
-        this.updateInterrupts();
+        this.writeIMask(val & 0xffff);
         return;
       }
-      if (paddr === 0x1f801076) {
-        return;
-      }
+      if (paddr === 0x1f801076) return;
       if (paddr === 0x1f8010f4) {
         this.dicrLow = val & 0x7fff;
         this.forceIrq = (val & 0x8000) !== 0;
@@ -1121,6 +1356,10 @@ export class Memory {
         this.writeTimer16(paddr, val);
         return;
       }
+      if (paddr >= 0x1f801c00 && paddr < 0x1f802000) {
+        this.spu.write16(paddr, val);
+        return;
+      }
       const aligned = paddr & ~3;
       const current = this.readIo32(aligned);
       const shift = (paddr & 2) * 8;
@@ -1129,12 +1368,16 @@ export class Memory {
       return;
     }
 
+    // BIOS
+    if (paddr >= 0x1fc00000 && paddr < 0x1fc80000) return;
+
+    // Open Bus
+    if (paddr >= 0x1f000000 && paddr <= 0x1fffffff) {
+      return;
+    }
+
     const hex = `0x${paddr.toString(16).toUpperCase()}`;
     logWarnRateLimited(`unmapped_write16_${paddr}`, `[Memory] Unhandled Hardware Write16 to unmapped address: ${hex} = 0x${val.toString(16).toUpperCase()}`);
-    if (this.onLog && !this.loggedUnmapped.has(paddr)) {
-      this.loggedUnmapped.add(paddr);
-      this.onLog('warn', `Unmapped MMIO write16: ${hex} = 0x${val.toString(16).toUpperCase()}`, paddr);
-    }
   }
 
   // ==========================================
@@ -1147,7 +1390,7 @@ export class Memory {
       this.flushCycles();
     }
 
-    // RAM (Cache isolation check, 2 MB wrap mask)
+    // RAM
     if (paddr < 0x1f000000) {
       if (this.isCacheIsolated) return;
       const ramAddr = paddr & 0x001fffff;
@@ -1155,24 +1398,26 @@ export class Memory {
       this.ram[ramAddr] = val;
       return;
     }
+
+    // Scratchpad
     if (paddr >= 0x1f800000 && paddr < 0x1f800400) {
-      this.scratchpad[paddr - 0x1f800000] = val;
+      this.scratchpad[paddr & 0x3ff] = val;
       return;
     }
 
-    // SIO0 / Controller Data Register
+    // SIO
     if (paddr === 0x1f801040) {
       this.writeJoyData(val);
       return;
     }
 
-    // CD-ROM Controller 8-bit writes (0x1F801800 - 0x1F801803)
+    // CD-ROM
     if (paddr >= 0x1f801800 && paddr <= 0x1f801803) {
       this.writeCdrom(paddr & 3, val);
       return;
     }
 
-    // I_STAT byte writes (0=clear, 1=no change)
+    // I_STAT byte writes
     if (paddr === 0x1f801070) {
       this.writeIStat(0xff00 | (val & 0xff));
       return;
@@ -1181,23 +1426,19 @@ export class Memory {
       this.writeIStat(((val & 0xff) << 8) | 0x00ff);
       return;
     }
-    if (paddr === 0x1f801072 || paddr === 0x1f801073) {
-      return;
-    }
+    if (paddr === 0x1f801072 || paddr === 0x1f801073) return;
 
     // I_MASK byte writes
     if (paddr === 0x1f801074) {
-      this.iMask = (this.iMask & 0xff00) | (val & 0xff);
-      this.updateInterrupts();
+      this.writeIMask((this.iMask & 0xff00) | (val & 0xff));
       return;
     }
     if (paddr === 0x1f801075) {
-      this.iMask = (this.iMask & 0x00ff) | ((val & 0xff) << 8);
-      this.updateInterrupts();
+      this.writeIMask((this.iMask & 0x00ff) | ((val & 0xff) << 8));
       return;
     }
 
-    // TTY serial debug port (0x1F801050 or Expansion 2 debug write)
+    // TTY serial debug port
     if (paddr === 0x1f801050 || paddr === 0x1f802023 || paddr === 0x1f802020) {
       if (this.onTtyChar) {
         this.onTtyChar(String.fromCharCode(val));
@@ -1205,7 +1446,7 @@ export class Memory {
       return;
     }
 
-    // POST Diagnostic Register (0x1F802041)
+    // POST Diagnostic Register
     if (paddr === 0x1f802041) {
       if (this.onLog) {
         this.onLog(
@@ -1217,12 +1458,7 @@ export class Memory {
       return;
     }
 
-    // JOY_DATA (0x1F801040)
-    if (paddr === 0x1f801040) {
-      this.writeJoyData(val & 0xff);
-      return;
-    }
-    // JOY_CTRL (0x1F80104A / 0x1F80104B)
+    // JOY_CTRL
     if (paddr === 0x1f80104a) {
       this.writeJoyCtrl((this.joyCtrl & 0xff00) | (val & 0xff));
       return;
@@ -1232,6 +1468,13 @@ export class Memory {
       return;
     }
 
+    // SPU
+    if (paddr >= 0x1f801c00 && paddr < 0x1f802000) {
+      this.spu.write8(paddr, val);
+      return;
+    }
+
+    // Generic IO
     if (paddr >= 0x1f801000 && paddr < 0x1f803000) {
       const aligned = paddr & ~3;
       const current = this.readIo32(aligned);
@@ -1241,12 +1484,16 @@ export class Memory {
       return;
     }
 
+    // BIOS
+    if (paddr >= 0x1fc00000 && paddr < 0x1fc80000) return;
+
+    // Open Bus
+    if (paddr >= 0x1f000000 && paddr <= 0x1fffffff) {
+      return;
+    }
+
     const hex = `0x${paddr.toString(16).toUpperCase()}`;
     logWarnRateLimited(`unmapped_write8_${paddr}`, `[Memory] Unhandled Hardware Write8 to unmapped address: ${hex} = 0x${val.toString(16).toUpperCase()}`);
-    if (this.onLog && !this.loggedUnmapped.has(paddr)) {
-      this.loggedUnmapped.add(paddr);
-      this.onLog('warn', `Unmapped MMIO write8: ${hex} = 0x${val.toString(16).toUpperCase()}`, paddr);
-    }
   }
 
   // ==========================================
@@ -1264,6 +1511,18 @@ export class Memory {
         return this.iStat;
       case 0x1f801074: // I_MASK
         return this.iMask;
+      case 0x1f801080: // DMA 0 (MDEC In) Base Address
+        return this.dma.dma0Madr;
+      case 0x1f801084: // DMA 0 (MDEC In) Block Control
+        return this.dma.dma0Bcr;
+      case 0x1f801088: // DMA 0 (MDEC In) Channel Control
+        return this.dma.dma0Chcr;
+      case 0x1f801090: // DMA 1 (MDEC Out) Base Address
+        return this.dma.dma1Madr;
+      case 0x1f801094: // DMA 1 (MDEC Out) Block Control
+        return this.dma.dma1Bcr;
+      case 0x1f801098: // DMA 1 (MDEC Out) Channel Control
+        return this.dma.dma1Chcr;
       case 0x1f8010a0: // DMA 2 (GPU) Base Address (MADR2)
         return this.dma2Madr;
       case 0x1f8010a4: // DMA 2 (GPU) Block Control (BCR2)
@@ -1271,10 +1530,13 @@ export class Memory {
       case 0x1f8010a8: // DMA 2 (GPU) Channel Control (CHCR2)
         return this.dma2Chcr;
       case 0x1f8010b0: // DMA 3 (CD-ROM) Base Address (MADR3)
+        if (this.onLog) this.onLog('bios', `[DMA3 READ 0x1F8010B0] MADR3: 0x${this.dma3Madr.toString(16).toUpperCase()}`);
         return this.dma3Madr;
       case 0x1f8010b4: // DMA 3 (CD-ROM) Block Control (BCR3)
+        if (this.onLog) this.onLog('bios', `[DMA3 READ 0x1F8010B4] BCR3: 0x${this.dma3Bcr.toString(16).toUpperCase()}`);
         return this.dma3Bcr;
       case 0x1f8010b8: // DMA 3 (CD-ROM) Channel Control (CHCR3)
+        if (this.onLog) this.onLog('bios', `[DMA3 READ 0x1F8010B8] CHCR3: 0x${this.dma3Chcr.toString(16).toUpperCase()}`);
         return this.dma3Chcr;
       case 0x1f801040: // JOY_DATA
         return this.readJoyData();
@@ -1295,14 +1557,10 @@ export class Memory {
         return this.timersCtrl.readMode(0);
       case 0x1f801108: // Timer 0 Target
         return this.timersCtrl.readTarget(0);
-      case 0x1f801110: // Timer 1 Current Value (Root Counter 1)
-        {
-          const cycles = this.cpu ? (this.cpu.cycles || this.cpu.instructionsExecuted || 0) : this.timerTicks;
-          const scanline = Math.floor((cycles / 2170) % 263);
-          return scanline & 0xffff;
-        }
-      case 0x1f801114: // Timer 1 Mode / Status
-        return (1 << 11) | (1 << 12) | (1 << 10);
+      case 0x1f801110: // Timer 1 Counter
+        return this.timersCtrl.readCounter(1);
+      case 0x1f801114: // Timer 1 Mode
+        return this.timersCtrl.readMode(1);
       case 0x1f801118: // Timer 1 Target
         return this.timersCtrl.readTarget(1);
       case 0x1f801120: // Timer 2 Counter
@@ -1311,6 +1569,12 @@ export class Memory {
         return this.timersCtrl.readMode(2);
       case 0x1f801128: // Timer 2 Target
         return this.timersCtrl.readTarget(2);
+      case 0x1f8010c0: // DMA 4 (SPU) Base Address (MADR4)
+        return this.dma.dma4Madr;
+      case 0x1f8010c4: // DMA 4 (SPU) Block Control (BCR4)
+        return this.dma.dma4Bcr;
+      case 0x1f8010c8: // DMA 4 (SPU) Channel Control (CHCR4)
+        return this.dma.dma4Chcr;
       case 0x1f801800: // CD-ROM Controller Registers (0x1F801800 - 0x1F801803)
         return (this.readCdrom(0) | (this.readCdrom(1) << 8) | (this.readCdrom(2) << 16) | (this.readCdrom(3) << 24)) >>> 0;
       case 0x1f801802:
@@ -1325,7 +1589,6 @@ export class Memory {
           const cycles = this.cpu ? (this.cpu.cycles || this.cpu.instructionsExecuted || 0) : this.timerTicks;
           let stat = this.gpu ? this.gpu.readStat(cycles) : (this.gpuStatHandler ? this.gpuStatHandler() : 0x14002000);
           stat |= (1 << 26); // Ready to receive DMA block
-          stat |= (1 << 27); // Ready to send VRAM to CPU
           stat |= (1 << 28); // Ready to receive command word / GPU idle
 
           const isOddField = (Math.floor(cycles / 564480) & 1) !== 0;
@@ -1336,10 +1599,14 @@ export class Memory {
           }
           return stat >>> 0;
         }
+      case 0x1f801820: // MDEC Data Out
+        return this.mdec.readData();
       case 0x1f801824: // MDEC Status
-        return 0x00000000;
+        return this.mdec.readStatus();
       default:
-        // Return stored generic IO register
+        if (paddr >= 0x1f801c00 && paddr < 0x1f802000) {
+          return this.spu.read32(paddr);
+        }
         const offset = paddr - 0x1f801000;
         return this.safeReadIo32(offset);
     }
@@ -1347,86 +1614,116 @@ export class Memory {
 
   private writeIo32(paddr: number, val: number): void {
     switch (paddr) {
-      case 0x1f801040: // JOY_DATA
+      case 0x1f801040:
         this.writeJoyData(val & 0xff);
         break;
-      case 0x1f801048: // JOY_MODE / JOY_CTRL
+      case 0x1f801048:
         this.joyMode = val & 0xffff;
         this.writeJoyCtrl((val >>> 16) & 0xffff);
         break;
-      case 0x1f801060: // RAM_SIZE
+      case 0x1f801060:
         this.ramSize = val;
         break;
-      case 0x1f801070: // I_STAT
+      case 0x1f801070:
         this.writeIStat(val);
         break;
-      case 0x1f801074: // I_MASK
-        this.iMask = val & 0xFFFF;
-        this.updateInterrupts();
+      case 0x1f801074:
+        this.writeIMask(val);
         break;
-      case 0x1f8010a0: // DMA 2 (GPU) Base Address (MADR2)
+      case 0x1f801080:
+        this.dma.writeMadr0(val);
+        break;
+      case 0x1f801084:
+        this.dma.writeBcr0(val);
+        break;
+      case 0x1f801088:
+        this.dma.writeChcr0(val, this);
+        break;
+      case 0x1f801090:
+        this.dma.writeMadr1(val);
+        break;
+      case 0x1f801094:
+        this.dma.writeBcr1(val);
+        break;
+      case 0x1f801098:
+        this.dma.writeChcr1(val, this);
+        break;
+      case 0x1f8010a0:
         this.dma.writeMadr2(val);
         this.dma2Madr = this.dma.dma2Madr;
         this.safeWriteIo32(0x1f8010a0 - 0x1f801000, this.dma2Madr);
         break;
-      case 0x1f8010a4: // DMA 2 (GPU) Block Control (BCR2)
+      case 0x1f8010a4:
         this.dma.writeBcr2(val);
         this.dma2Bcr = this.dma.dma2Bcr;
         this.safeWriteIo32(0x1f8010a4 - 0x1f801000, this.dma2Bcr);
         break;
-      case 0x1f8010a8: // DMA 2 (GPU) Channel Control (CHCR2)
+      case 0x1f8010a8:
         this.writeDmaGpu(val);
         break;
-      case 0x1f8010b0: // DMA 3 (CD-ROM) Base Address (MADR3)
+      case 0x1f8010b0:
+        if (this.onLog) this.onLog('bios', `[DMA3 WRITE 0x1F8010B0] MADR3 = 0x${val.toString(16).toUpperCase()}`);
         this.dma.writeMadr3(val);
         this.dma3Madr = this.dma.dma3Madr;
         this.safeWriteIo32(0x1f8010b0 - 0x1f801000, this.dma3Madr);
         break;
-      case 0x1f8010b4: // DMA 3 (CD-ROM) Block Control (BCR3)
+      case 0x1f8010b4:
+        if (this.onLog) this.onLog('bios', `[DMA3 WRITE 0x1F8010B4] BCR3 = 0x${val.toString(16).toUpperCase()}`);
         this.dma.writeBcr3(val);
         this.dma3Bcr = this.dma.dma3Bcr;
         this.safeWriteIo32(0x1f8010b4 - 0x1f801000, this.dma3Bcr);
         break;
-      case 0x1f8010b8: // DMA 3 (CD-ROM) Channel Control (CHCR3)
+      case 0x1f8010b8:
+        if (this.onLog) this.onLog('bios', `[DMA3 WRITE 0x1F8010B8] CHCR3 = 0x${val.toString(16).toUpperCase()}`);
         this.writeDmaCdrom(val);
         break;
-      case 0x1f8010e8: // DMA 6 (OTC) Channel Control
+      case 0x1f8010c0:
+        this.dma.writeMadr4(val);
+        break;
+      case 0x1f8010c4:
+        this.dma.writeBcr4(val);
+        break;
+      case 0x1f8010c8:
+        this.dma.writeChcr4(val, this, this.spu);
+        break;
+      case 0x1f8010e8:
         this.writeDmaOtc(val);
         break;
-      case 0x1f8010f0: // DPCR
+      case 0x1f8010f0:
         this.dpcr = val;
+        this.dma.dpcr = val;
         break;
-      case 0x1f8010f4: // DICR - DMA Interrupt Register
+      case 0x1f8010f4:
         this.writeDicr(val);
         break;
-      case 0x1f801100: // Timer 0 Counter
+      case 0x1f801100:
         this.timersCtrl.writeCounter(0, val);
         break;
-      case 0x1f801104: // Timer 0 Mode
+      case 0x1f801104:
         this.timersCtrl.writeMode(0, val);
         break;
-      case 0x1f801108: // Timer 0 Target
+      case 0x1f801108:
         this.timersCtrl.writeTarget(0, val);
         break;
-      case 0x1f801110: // Timer 1 Counter
+      case 0x1f801110:
         this.timersCtrl.writeCounter(1, val);
         break;
-      case 0x1f801114: // Timer 1 Mode
+      case 0x1f801114:
         this.timersCtrl.writeMode(1, val);
         break;
-      case 0x1f801118: // Timer 1 Target
+      case 0x1f801118:
         this.timersCtrl.writeTarget(1, val);
         break;
-      case 0x1f801120: // Timer 2 Counter
+      case 0x1f801120:
         this.timersCtrl.writeCounter(2, val);
         break;
-      case 0x1f801124: // Timer 2 Mode
+      case 0x1f801124:
         this.timersCtrl.writeMode(2, val);
         break;
-      case 0x1f801128: // Timer 2 Target
+      case 0x1f801128:
         this.timersCtrl.writeTarget(2, val);
         break;
-      case 0x1f801800: // CD-ROM Controller Registers
+      case 0x1f801800:
         this.writeCdrom(0, val & 0xff);
         this.writeCdrom(1, (val >>> 8) & 0xff);
         this.writeCdrom(2, (val >>> 16) & 0xff);
@@ -1441,19 +1738,29 @@ export class Memory {
       case 0x1f801803:
         this.writeCdrom(3, val & 0xff);
         break;
-      case 0x1f801810: // GP0 (Write commands to GPU)
+      case 0x1f801810:
         if (this.gpu) {
           this.gpu.sendGp0(val);
         } else if (this.gpuWriteHandler) {
           this.gpuWriteHandler(val);
         }
         break;
-      case 0x1f801814: // GP1 (Write control to GPU)
+      case 0x1f801814:
         if (this.gpuGp1Handler) {
           this.gpuGp1Handler(val);
         }
         break;
+      case 0x1f801820:
+        this.mdec.writeCommand(val);
+        break;
+      case 0x1f801824:
+        this.mdec.writeControl(val);
+        break;
       default:
+        if (paddr >= 0x1f801c00 && paddr < 0x1f802000) {
+          this.spu.write32(paddr, val);
+          return;
+        }
         const offset = paddr - 0x1f801000;
         this.safeWriteIo32(offset, val);
         break;
@@ -1463,6 +1770,7 @@ export class Memory {
   public writeDmaGpu(chcr: number): void {
     this.dma.dma2Madr = this.dma2Madr;
     this.dma.dma2Bcr = this.dma2Bcr;
+    this.dma.gpu = this.gpu;
     this.dma.writeChcr2(chcr, this, this.gpu);
     this.dma2Madr = this.dma.dma2Madr;
     this.dma2Bcr = this.dma.dma2Bcr;
@@ -1473,10 +1781,11 @@ export class Memory {
   }
 
   private writeDmaOtc(chcr: number): void {
-    if ((chcr & 0x01000000) !== 0) {
+    if ((chcr & 0x01000000) !== 0 || (chcr & 0x10000000) !== 0) {
       const madr = this.readIo32(0x1f8010e0);
       const bcr = this.readIo32(0x1f8010e4);
       let entries = bcr & 0xffff;
+      if (entries === 0) entries = 0x10000;
       let addr = madr & 0x1ffffc;
       while (entries > 1 && addr >= 4 && addr <= this.ram.length - 4) {
         this.safeWriteRam32(addr, (addr - 4) & 0x00ffffff);
@@ -1486,7 +1795,7 @@ export class Memory {
       if (addr <= this.ram.length - 4) {
         this.safeWriteRam32(addr, 0x00ffffff);
       }
-      this.safeWriteIo32(0x1f8010e8 - 0x1f801000, chcr & ~0x01000000);
+      this.safeWriteIo32(0x1f8010e8 - 0x1f801000, chcr & ~0x11000000);
       this.triggerDmaIrq(6);
     } else {
       this.safeWriteIo32(0x1f8010e8 - 0x1f801000, chcr);
@@ -1510,13 +1819,8 @@ export class Memory {
       case 0x1f801100: return this.timersCtrl.readCounter(0);
       case 0x1f801104: return this.timersCtrl.readMode(0);
       case 0x1f801108: return this.timersCtrl.readTarget(0);
-      case 0x1f801110:
-        {
-          const cycles = this.cpu ? (this.cpu.cycles || this.cpu.instructionsExecuted || 0) : this.timerTicks;
-          const scanline = Math.floor((cycles / 2170) % 263);
-          return scanline & 0xffff;
-        }
-      case 0x1f801114: return (1 << 11) | (1 << 12) | (1 << 10);
+      case 0x1f801110: return this.timersCtrl.readCounter(1);
+      case 0x1f801114: return this.timersCtrl.readMode(1);
       case 0x1f801118: return this.timersCtrl.readTarget(1);
       case 0x1f801120: return this.timersCtrl.readCounter(2);
       case 0x1f801124: return this.timersCtrl.readMode(2);

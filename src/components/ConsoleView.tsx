@@ -18,13 +18,14 @@ export const ConsoleView: React.FC<ConsoleViewProps> = ({
   onTogglePause,
   onClose,
 }) => {
-  const [activeFilter, setActiveFilter] = useState<'all' | 'system' | 'bios' | 'tty' | 'disasm' | 'error'>('all');
+  const [activeFilter, setActiveFilter] = useState<'all' | 'gpu' | 'system' | 'bios' | 'tty' | 'disasm' | 'error'>('all');
   const [searchQuery, setSearchQuery] = useState('');
   const [inputCommand, setInputCommand] = useState('');
   const [autoScroll, setAutoScroll] = useState(true);
   const containerRef = useRef<HTMLDivElement | null>(null);
 
   const filteredLogs = logs.filter((log) => {
+    if (activeFilter === 'gpu' && log.type !== 'gpu') return false;
     if (activeFilter === 'system' && log.type !== 'system') return false;
     if (activeFilter === 'bios' && log.type !== 'bios') return false;
     if (activeFilter === 'tty' && log.type !== 'tty') return false;
@@ -81,13 +82,13 @@ export const ConsoleView: React.FC<ConsoleViewProps> = ({
 
         {/* Filter Tabs */}
         <div className="flex items-center gap-1 text-[11px]">
-          {(['all', 'system', 'bios', 'tty', 'disasm', 'error'] as const).map((filter) => (
+          {(['all', 'gpu', 'system', 'bios', 'tty', 'disasm', 'error'] as const).map((filter) => (
             <button
               key={filter}
               onClick={() => setActiveFilter(filter)}
               className={`px-2 py-0.5 rounded-xs border text-[10px] uppercase font-bold transition-colors ${
                 activeFilter === filter
-                  ? 'bg-blue-900 text-white border-blue-500'
+                  ? (filter === 'gpu' ? 'bg-fuchsia-900 text-white border-fuchsia-500' : 'bg-blue-900 text-white border-blue-500')
                   : 'bg-zinc-900 text-zinc-400 border-zinc-800 hover:text-zinc-200'
               }`}
             >
@@ -170,9 +171,11 @@ export const ConsoleView: React.FC<ConsoleViewProps> = ({
             let color = 'text-zinc-300';
             if (log.type === 'error') color = 'text-red-400 font-bold';
             else if (log.type === 'warn') color = 'text-yellow-400';
+            else if (log.type === 'gpu') color = 'text-fuchsia-300 font-medium';
             else if (log.type === 'tty') color = 'text-emerald-400 font-semibold';
             else if (log.type === 'disasm') color = 'text-cyan-400';
             else if (log.type === 'bios') color = 'text-purple-400 font-medium';
+            else if (log.type === 'gte') color = 'text-fuchsia-400 font-medium';
 
             return (
               <div key={log.id} className="flex items-start gap-1.5 py-0.5 px-1 hover:bg-zinc-900/60 rounded-xs">

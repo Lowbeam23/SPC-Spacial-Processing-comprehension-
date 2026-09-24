@@ -35,8 +35,8 @@ export function disassemble(pc: number, opcode: number): DisassembledInstruction
           description = `Shift ${regT} left by ${shamt}`;
           break;
         case 0x01:
-          assembly = `hint/nop (funct 0x01)`;
-          description = `Compiler branch hint / NOP`;
+          assembly = ((opcode >>> 16) & 1) ? `movt ${regD}, ${regS}` : `movf ${regD}, ${regS}`;
+          description = `Move conditional on FP flag`;
           break;
         case 0x02:
           assembly = `srl ${regD}, ${regT}, ${shamt}`;
@@ -63,6 +63,14 @@ export function disassemble(pc: number, opcode: number): DisassembledInstruction
           assembly = `jalr ${regD}, ${regS}`;
           description = `Jump to ${regS} and link in ${regD}`;
           break;
+        case 0x0a:
+          assembly = `movz ${regD}, ${regS}, ${regT}`;
+          description = `Move if zero: ${regD} = ${regS} if ${regT} == 0`;
+          break;
+        case 0x0b:
+          assembly = `movn ${regD}, ${regS}, ${regT}`;
+          description = `Move if not zero: ${regD} = ${regS} if ${regT} != 0`;
+          break;
         case 0x0c:
           assembly = 'syscall';
           description = 'System call exception';
@@ -70,6 +78,10 @@ export function disassemble(pc: number, opcode: number): DisassembledInstruction
         case 0x0d:
           assembly = 'break';
           description = 'Breakpoint exception';
+          break;
+        case 0x0f:
+          assembly = 'sync';
+          description = 'Synchronize shared memory';
           break;
         case 0x10:
           assembly = `mfhi ${regD}`;
@@ -83,6 +95,15 @@ export function disassemble(pc: number, opcode: number): DisassembledInstruction
         case 0x13:
           assembly = `mtlo ${regS}`;
           break;
+        case 0x14:
+          assembly = `dsllv ${regD}, ${regT}, ${regS}`;
+          break;
+        case 0x16:
+          assembly = `dsrlv ${regD}, ${regT}, ${regS}`;
+          break;
+        case 0x17:
+          assembly = `dsrav ${regD}, ${regT}, ${regS}`;
+          break;
         case 0x18:
           assembly = `mult ${regS}, ${regT}`;
           break;
@@ -94,6 +115,18 @@ export function disassemble(pc: number, opcode: number): DisassembledInstruction
           break;
         case 0x1b:
           assembly = `divu ${regS}, ${regT}`;
+          break;
+        case 0x1c:
+          assembly = `dmult ${regS}, ${regT}`;
+          break;
+        case 0x1d:
+          assembly = `dmultu ${regS}, ${regT}`;
+          break;
+        case 0x1e:
+          assembly = `ddiv ${regS}, ${regT}`;
+          break;
+        case 0x1f:
+          assembly = `ddivu ${regS}, ${regT}`;
           break;
         case 0x20:
           assembly = `add ${regD}, ${regS}, ${regT}`;
@@ -119,11 +152,65 @@ export function disassemble(pc: number, opcode: number): DisassembledInstruction
         case 0x27:
           assembly = `nor ${regD}, ${regS}, ${regT}`;
           break;
+        case 0x28:
+          assembly = `mfsa ${regD}`;
+          break;
+        case 0x29:
+          assembly = `mtsa ${regS}`;
+          break;
         case 0x2a:
           assembly = `slt ${regD}, ${regS}, ${regT}`;
           break;
         case 0x2b:
           assembly = `sltu ${regD}, ${regS}, ${regT}`;
+          break;
+        case 0x2c:
+          assembly = `dadd ${regD}, ${regS}, ${regT}`;
+          break;
+        case 0x2d:
+          assembly = `daddu ${regD}, ${regS}, ${regT}`;
+          break;
+        case 0x2e:
+          assembly = `dsub ${regD}, ${regS}, ${regT}`;
+          break;
+        case 0x2f:
+          assembly = `dsubu ${regD}, ${regS}, ${regT}`;
+          break;
+        case 0x30:
+          assembly = `tge ${regS}, ${regT}`;
+          break;
+        case 0x31:
+          assembly = `tgeu ${regS}, ${regT}`;
+          break;
+        case 0x32:
+          assembly = `tlt ${regS}, ${regT}`;
+          break;
+        case 0x33:
+          assembly = `tltu ${regS}, ${regT}`;
+          break;
+        case 0x34:
+          assembly = `teq ${regS}, ${regT}`;
+          break;
+        case 0x36:
+          assembly = `tne ${regS}, ${regT}`;
+          break;
+        case 0x38:
+          assembly = `dsll ${regD}, ${regT}, ${shamt}`;
+          break;
+        case 0x3a:
+          assembly = `dsrl ${regD}, ${regT}, ${shamt}`;
+          break;
+        case 0x3b:
+          assembly = `dsra ${regD}, ${regT}, ${shamt}`;
+          break;
+        case 0x3c:
+          assembly = `dsll32 ${regD}, ${regT}, ${shamt}`;
+          break;
+        case 0x3e:
+          assembly = `dsrl32 ${regD}, ${regT}, ${shamt}`;
+          break;
+        case 0x3f:
+          assembly = `dsra32 ${regD}, ${regT}, ${shamt}`;
           break;
         default:
           assembly = `special.0x${funct.toString(16).padStart(2, '0')}`;
@@ -242,8 +329,18 @@ export function disassemble(pc: number, opcode: number): DisassembledInstruction
     case 0x2b: // SW
       assembly = `sw ${regT}, ${simm16}(${regS})`;
       break;
+    case 0x2c: // SDL
+      assembly = `sdl ${regT}, ${simm16}(${regS})`;
+      break;
+    case 0x2d: // SDR
+      assembly = `sdr ${regT}, ${simm16}(${regS})`;
+      break;
     case 0x2e: // SWR
       assembly = `swr ${regT}, ${simm16}(${regS})`;
+      break;
+    case 0x2f: // CACHE
+      assembly = `cache 0x${rt.toString(16)}, ${simm16}(${regS})`;
+      description = 'Cache operation';
       break;
     case 0x32: // LWC2
       assembly = `lwc2 ${regT}, ${simm16}(${regS})`;

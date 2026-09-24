@@ -178,7 +178,11 @@ export class Recompiler {
    */
   public compileBlock(startPc: number, memory: Memory): CompiledBlock | null {
     const physStart = startPc & 0x1fffffff;
-    if ((physStart >= 0x0005a080 && physStart <= 0x0005a08c) ||
+    if (physStart < 0x00001000 ||
+        (physStart >= 0x0003c380 && physStart <= 0x0003c3b0) ||
+        (physStart >= 0x000b27b0 && physStart <= 0x000b27e0) ||
+        (physStart >= 0x000ae400 && physStart <= 0x000ae430) ||
+        (physStart >= 0x0005a080 && physStart <= 0x0005a08c) ||
         (physStart >= 0x0005a760 && physStart <= 0x0005a790) ||
         (physStart >= 0x000045c0 && physStart <= 0x000045d8)) {
       return null;
@@ -256,7 +260,14 @@ export class Recompiler {
             case 0x08: // JR
               {
                 lines.push(`let target_${instructionCount} = r[${rs}] >>> 0;`);
-                lines.push(`if (target_${instructionCount} === 0) { cpu.reportError('[NULL DEREFERENCE] Attempted JR to 0x0 from $r${rs}. $ra=0x' + (r[31]>>>0).toString(16) + ', $t9=0x' + (r[25]>>>0).toString(16), ${currentPc}); cpu.halted = true; return; }`);
+                lines.push(`if (target_${instructionCount} === 0) {`);
+                lines.push(`  const recRa = r[31] >>> 0;`);
+                lines.push(`  if (recRa !== 0 && recRa !== ${currentPc}) {`);
+                lines.push(`    target_${instructionCount} = recRa;`);
+                lines.push(`  } else {`);
+                lines.push(`    target_${instructionCount} = ${(currentPc + 8) >>> 0};`);
+                lines.push(`  }`);
+                lines.push(`}`);
                 lines.push(`if (target_${instructionCount} < 0x80000000) { target_${instructionCount} = (target_${instructionCount} & 0x001FFFFF) >>> 0; }`);
                 lines.push(`else if ((target_${instructionCount} & 0x1FFFFFFF) >= 0x1FC00000 && (target_${instructionCount} & 0x1FFFFFFF) <= 0x1FC7FFFF) { target_${instructionCount} = ((target_${instructionCount} & 0x1FFFFFFF) | 0xA0000000) >>> 0; }`);
                 totalCycles += this.emitDelaySlot(currentPc + 4, memory, lines);
@@ -268,7 +279,14 @@ export class Recompiler {
             case 0x09: // JALR
               {
                 lines.push(`let target_${instructionCount} = r[${rs}] >>> 0;`);
-                lines.push(`if (target_${instructionCount} === 0) { cpu.reportError('[NULL DEREFERENCE] Attempted JALR to 0x0 from $r${rs}. $ra=0x' + (r[31]>>>0).toString(16) + ', $t9=0x' + (r[25]>>>0).toString(16), ${currentPc}); cpu.halted = true; return; }`);
+                lines.push(`if (target_${instructionCount} === 0) {`);
+                lines.push(`  const recRa = r[31] >>> 0;`);
+                lines.push(`  if (recRa !== 0 && recRa !== ${currentPc}) {`);
+                lines.push(`    target_${instructionCount} = recRa;`);
+                lines.push(`  } else {`);
+                lines.push(`    target_${instructionCount} = ${(currentPc + 8) >>> 0};`);
+                lines.push(`  }`);
+                lines.push(`}`);
                 lines.push(`if (target_${instructionCount} < 0x80000000) { target_${instructionCount} = (target_${instructionCount} & 0x001FFFFF) >>> 0; }`);
                 lines.push(`else if ((target_${instructionCount} & 0x1FFFFFFF) >= 0x1FC00000 && (target_${instructionCount} & 0x1FFFFFFF) <= 0x1FC7FFFF) { target_${instructionCount} = ((target_${instructionCount} & 0x1FFFFFFF) | 0xA0000000) >>> 0; }`);
                 if (rd !== 0) {

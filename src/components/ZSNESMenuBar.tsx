@@ -1,5 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { ExecutionMode, EmulationStatus, BiosInfo } from '../types';
+import { TEST_SUITES } from '../emulator/tests';
 
 interface ZSNESMenuBarProps {
   status: EmulationStatus;
@@ -18,10 +19,13 @@ interface ZSNESMenuBarProps {
   onUnloadBios: () => void;
   onOpenMountDisc: () => void;
   onEjectDisc: () => void;
+  onBootBios?: () => void;
+  onLaunchGame?: () => void;
   onRun: () => void;
   onPause: () => void;
   onStep: () => void;
   onReset: () => void;
+  onRunTest?: (testId: string) => void;
   onModeChange: (mode: ExecutionMode) => void;
   onSpeedChange: (speed: number) => void;
   onToggleScanlines: () => void;
@@ -48,10 +52,13 @@ export const ZSNESMenuBar: React.FC<ZSNESMenuBarProps> = ({
   onUnloadBios,
   onOpenMountDisc,
   onEjectDisc,
+  onBootBios,
+  onLaunchGame,
   onRun,
   onPause,
   onStep,
   onReset,
+  onRunTest,
   onModeChange,
   onSpeedChange,
   onToggleScanlines,
@@ -131,6 +138,22 @@ export const ZSNESMenuBar: React.FC<ZSNESMenuBarProps> = ({
                 <span>📂 LOAD BIOS ROM (512KB)...</span>
               </button>
 
+              {onBootBios && (
+                <button
+                  id="menu-boot-bios-btn"
+                  disabled={hasDiscLoaded || !hasBiosLoaded}
+                  onClick={() => handleAction(onBootBios)}
+                  className={`px-3 py-1.5 text-left flex justify-between items-center group font-semibold ${
+                    !hasDiscLoaded && hasBiosLoaded
+                      ? 'text-blue-300 hover:bg-[#b30059] hover:text-white cursor-pointer'
+                      : 'text-zinc-500 cursor-not-allowed opacity-50'
+                  }`}
+                >
+                  <span>▶ BOOT BIOS / DASHBOARD</span>
+                  <span className="text-[10px] text-zinc-400">[BEV=1]</span>
+                </button>
+              )}
+
               {hasBiosLoaded && biosInfo && (
                 <>
                   <div className="my-1 border-t border-zinc-700 border-b border-zinc-900" />
@@ -163,7 +186,7 @@ export const ZSNESMenuBar: React.FC<ZSNESMenuBarProps> = ({
                 : 'bg-gradient-to-b from-zinc-700 to-zinc-800 border-t border-l border-zinc-500 border-b border-r border-zinc-950 text-zinc-200 hover:text-white'
             }`}
           >
-            DISC
+            DISC / ZIP
             {hasDiscLoaded && <span className="text-cyan-400 text-[9px]">●</span>}
           </button>
 
@@ -177,8 +200,24 @@ export const ZSNESMenuBar: React.FC<ZSNESMenuBarProps> = ({
                 onClick={() => handleAction(onOpenMountDisc)}
                 className="px-3 py-1.5 text-left flex justify-between items-center hover:bg-[#b30059] hover:text-white group font-semibold text-cyan-300"
               >
-                <span>💿 MOUNT DISC (.BIN / .ISO)...</span>
+                <span>💿 MOUNT DISC / ZIP (.ZIP, .CUE, .BIN, .ISO)...</span>
               </button>
+
+              {onLaunchGame && (
+                <button
+                  id="menu-launch-game-btn"
+                  disabled={!hasDiscLoaded}
+                  onClick={() => handleAction(onLaunchGame)}
+                  className={`px-3 py-1.5 text-left flex justify-between items-center group font-semibold ${
+                    hasDiscLoaded
+                      ? 'text-emerald-300 hover:bg-[#b30059] hover:text-white cursor-pointer'
+                      : 'text-zinc-500 cursor-not-allowed opacity-50'
+                  }`}
+                >
+                  <span>⚡ LAUNCH PS1 GAME (HLE)</span>
+                  <span className="text-[10px] text-zinc-400">[BEV=0]</span>
+                </button>
+              )}
 
               {hasDiscLoaded && (
                 <>
@@ -191,7 +230,7 @@ export const ZSNESMenuBar: React.FC<ZSNESMenuBarProps> = ({
                     onClick={() => handleAction(onEjectDisc)}
                     className="px-3 py-1 text-left flex justify-between items-center hover:bg-[#b30059] hover:text-white group text-red-300"
                   >
-                    <span>⏏ EJECT DISC (OPEN TRAY)</span>
+                    <span>⏏ EJECT / CLEAR MEDIA</span>
                   </button>
                 </>
               )}
@@ -251,6 +290,75 @@ export const ZSNESMenuBar: React.FC<ZSNESMenuBarProps> = ({
                 <span>RESET</span>
                 <span className="text-[10px] text-zinc-400 group-hover:text-white">[F2]</span>
               </button>
+            </div>
+          )}
+        </div>
+
+        {/* [TESTS] Menu */}
+        <div className="relative">
+          <button
+            id="menu-tests-btn"
+            onClick={() => toggleMenu('tests')}
+            className={`px-3 py-0.5 rounded-sm border text-[11px] font-bold tracking-wider uppercase transition-colors flex items-center gap-1 ${
+              openMenu === 'tests'
+                ? 'bg-blue-900 text-white border-blue-400'
+                : 'bg-gradient-to-b from-amber-700 to-amber-900 border-t border-l border-amber-500 border-b border-r border-amber-950 text-amber-100 hover:text-white hover:from-amber-600 hover:to-amber-800'
+            }`}
+          >
+            <span>TESTS</span>
+            <span className="text-[9px] bg-amber-400/20 text-amber-300 px-1 rounded-xs font-mono font-normal">{TEST_SUITES.length}</span>
+          </button>
+
+          {openMenu === 'tests' && (
+            <div
+              id="dropdown-tests"
+              className="absolute left-0 top-full mt-1 w-80 bg-[#24242e] border-t-2 border-l-2 border-zinc-400 border-b-2 border-r-2 border-black shadow-2xl py-1 text-zinc-200 flex flex-col z-50 divide-y divide-zinc-800/80"
+            >
+              <div className="px-3 py-1 text-[10px] font-bold uppercase tracking-wider text-amber-400 bg-zinc-900/60 flex items-center justify-between">
+                <span>Hardware Test Suites</span>
+                <span className="text-zinc-500 font-normal">GPU • GTE • SPU • CD-ROM</span>
+              </div>
+
+              {TEST_SUITES.map((test) => (
+                <button
+                  key={test.id}
+                  id={`menu-test-${test.id}-btn`}
+                  onClick={() => handleAction(() => onRunTest && onRunTest(test.id))}
+                  className="px-3 py-2 text-left hover:bg-[#b30059] hover:text-white group transition-colors flex flex-col gap-0.5"
+                >
+                  <div className="flex items-center justify-between">
+                    <span className="font-bold text-[11px] text-zinc-100 group-hover:text-white flex items-center gap-1.5">
+                      <span className="text-amber-400 group-hover:text-amber-200">▶</span>
+                      {test.name}
+                    </span>
+                    <span className={`text-[9px] px-1 py-0.2 rounded font-mono font-bold ${
+                      test.category === 'GPU'
+                        ? 'bg-blue-950 text-blue-300 border border-blue-800'
+                        : test.category === 'GTE'
+                        ? 'bg-purple-950 text-purple-300 border border-purple-800'
+                        : test.category === 'SPU'
+                        ? 'bg-amber-950 text-amber-300 border border-amber-800'
+                        : test.category === 'CD-ROM'
+                        ? 'bg-cyan-950 text-cyan-300 border border-cyan-800'
+                        : 'bg-emerald-950 text-emerald-300 border border-emerald-800'
+                    }`}>
+                      {test.category}
+                    </span>
+                  </div>
+                  <div className="text-[10px] text-zinc-400 group-hover:text-zinc-200 leading-tight">
+                    {test.description}
+                  </div>
+                </button>
+              ))}
+
+              <div className="p-1 bg-zinc-900/80 flex items-center justify-between">
+                <button
+                  onClick={() => handleAction(onReset)}
+                  className="w-full text-center px-2 py-1 text-[10px] text-red-300 hover:text-white hover:bg-red-900/50 rounded font-semibold transition-colors"
+                >
+                  ⏹ STOP TEST & RESET SYSTEM
+                </button>
+              </div>
             </div>
           )}
         </div>

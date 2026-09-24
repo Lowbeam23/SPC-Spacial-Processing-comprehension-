@@ -4,6 +4,8 @@
  * and reliable ISO-9660 / Raw Mode 2 Form 1/2 streaming.
  */
 
+import { VirtualDisc } from '../types';
+
 export interface DiscInfo {
   name: string;
   size: number;
@@ -38,6 +40,7 @@ export class CdRom {
   public hasDisc: boolean = false;
   public discInfo: DiscInfo | null = null;
   public exeHeader: PsxExeHeader | null = null;
+  public biosDashboardStubMode: boolean = false;
 
   // Controller State (0x1F801800 - 0x1F801803)
   public index: number = 0; // Register bank index (0..3)
@@ -139,6 +142,10 @@ export class CdRom {
   }
 
   public getStatus(): number {
+    if (this.biosDashboardStubMode) {
+      // In BIOS dashboard stub mode, report shell closed with motor spinning idle (0x02) so hardware self-tests pass cleanly
+      return 0x02;
+    }
     if (!this.hasDisc || this.isShellOpen) {
       return 0x10; // Bit 4: Shell open; Motor (bit 1), Read (bit 5), and Seek (bit 6) must be strictly 0
     }
@@ -156,9 +163,16 @@ export class CdRom {
   }
 
   public updateIrq(): void {
-    const isAsserted = (this.interruptFlag & this.interruptEnable) !== 0;
+    const isAsserted = (this.interruptFlag & (this.interruptEnable & 0x1f)) !== 0;
     if (this.onTriggerIrq) {
       this.onTriggerIrq(isAsserted);
+    }
+  }
+
+  public setIrq(code: number): void {
+    this.interruptFlag = (this.interruptFlag & 0xe0) | (code & 0x1f);
+    if (this.interruptFlag & (0x1f & this.interruptEnable)) {
+      this.updateIrq();
     }
   }
 
@@ -205,9 +219,44 @@ export class CdRom {
     this.updateIrq();
   }
 
-  public mountDisc(fileBuffer: ArrayBuffer | Uint8Array, fileName: string = 'game.iso'): DiscInfo {
-    const ab = fileBuffer instanceof ArrayBuffer ? fileBuffer : fileBuffer.buffer.slice(fileBuffer.byteOffset, fileBuffer.byteOffset + fileBuffer.byteLength);
+  public mount(discData: VirtualDisc | ArrayBuffer | Uint8Array, fileName: string = 'game.iso'): DiscInfo {
+    if ('data' in discData && 'sectorSize' in discData) {
+      // VirtualDisc object
+      this.discBuffer = discData.buffer;
+      this.discData = discData.data;
+      this.hasDisc = true;
+      this.isMotorOn = true;
+      this.isShellOpen = false;
+      this.status = 0x02;
+      this.interruptFlag = 0;
+
+      const info: DiscInfo = {
+        name: discData.name,
+        size: discData.data.length,
+        type: (discData.sectorSize === 2352 ? 'bin' : 'iso'),
+        volumeLabel: discData.volumeLabel || 'PlayStation Game Disc',
+        executableName: discData.primaryExecutable || 'PSX.EXE',
+        sectorSize: discData.sectorSize,
+        totalSectors: discData.totalSectors,
+      };
+
+      this.discInfo = info;
+      this.parseExeHeader();
+      this.pendingLidCycles = 0;
+
+      const logMsg = `CD-ROM: Mounted Virtual Disc "${info.name}" (${(info.size / (1024 * 1024)).toFixed(2)} MB, ${info.type.toUpperCase()}). Format: ${info.sectorSize}B sectors (${info.totalSectors.toLocaleString()} total). Executable: ${info.executableName}`;
+      console.log(`[CD-ROM MOUNT] ${logMsg}`);
+      if (this.onLog) this.onLog('system', logMsg);
+
+      return info;
+    }
+
+    const ab = discData instanceof ArrayBuffer ? discData : discData.buffer.slice(discData.byteOffset, discData.byteOffset + discData.byteLength);
     return this.setDisc(ab as ArrayBuffer, fileName);
+  }
+
+  public mountDisc(fileBuffer: ArrayBuffer | Uint8Array, fileName: string = 'game.iso'): DiscInfo {
+    return this.mount(fileBuffer, fileName);
   }
 
   public setDisc(fileBuffer: ArrayBuffer, fileName: string = 'game.iso'): DiscInfo {
@@ -368,7 +417,8 @@ export class CdRom {
       if (size % 2352 === 0 && size >= 2352 * 16) {
         sectorSize = 2352;
         type = 'bin';
-        const pvdOffset = 16 * 2352 + 24;
+        const mode = (16 * 2352 + 15 < size) ? data[16 * 2352 + 15] : 2;
+        const pvdOffset = 16 * 2352 + (mode === 1 ? 16 : 24);
         if (pvdOffset + 40 < size) {
           const magic = String.fromCharCode(data[pvdOffset + 1], data[pvdOffset + 2], data[pvdOffset + 3], data[pvdOffset + 4], data[pvdOffset + 5]);
           if (magic === 'CD001') {
@@ -488,6 +538,11 @@ export class CdRom {
   }
 
   public readDataByte(): number {
+    if (this.dataFifoIndex >= this.dataFifo.length && this.trackBufferLength > 0) {
+      this.dataFifo = Array.from(this.trackBuffer.subarray(0, this.trackBufferLength));
+      this.dataFifoIndex = 0;
+      this.trackBufferLength = 0;
+    }
     if (this.dataFifoIndex < this.dataFifo.length) {
       const val = this.dataFifo[this.dataFifoIndex++];
       this.pioBytesReadThisSector++;
@@ -520,11 +575,11 @@ export class CdRom {
       case 0: {
         // Status Register
         let stat = this.index & 0x03;
-        if (this.parameterFifo.length === 0) stat |= 0x08;
-        if (this.parameterFifo.length < 16) stat |= 0x10;
-        if (this.responseFifo.length > 0) stat |= 0x20;
-        if (this.dataFifoIndex < this.dataFifo.length) stat |= 0x40;
-        if (this.isReading || this.isSeeking || this.pendingCommandDelay > 0) stat |= 0x80;
+        if (this.parameterFifo.length === 0) stat |= 0x08; // PRMEMPTY
+        if (this.parameterFifo.length < 16) stat |= 0x10;  // PRMWRDY
+        if (this.responseFifo.length > 0) stat |= 0x20;     // RRDY
+        if (this.dataFifoIndex < this.dataFifo.length || this.trackBufferLength > 0) stat |= 0x40; // DRQ (Data FIFO or sector buffer ready)
+        if (this.pendingCommandDelay > 0) stat |= 0x80;     // BUSY (Command processing active)
         return stat;
       }
 
@@ -595,6 +650,7 @@ export class CdRom {
             // BFRD: Transfer sector trackBuffer into the readable Data FIFO
             this.dataFifo = Array.from(this.trackBuffer.subarray(0, this.trackBufferLength));
             this.dataFifoIndex = 0;
+            this.trackBufferLength = 0;
             this.pioBytesReadThisSector = 0;
 
             if (this.onDmaRequest) {
@@ -619,14 +675,16 @@ export class CdRom {
           // If active interrupt was completely cleared, deliver next queued interrupt
           if ((this.interruptFlag & 0x07) === 0) {
             this.interruptFlag = 0;
+            this.updateIrq(); // Deassert cleared interrupt line
             if (this.interruptQueue.length > 0) {
               const next = this.interruptQueue.shift()!;
               this.interruptFlag = next.flag & 0x07;
               this.responseFifo = [...next.response];
+              this.updateIrq(); // <--- CRITICAL FIX: MUST TRIGGER IRQ PIN HERE!
             }
+          } else {
+            this.updateIrq();
           }
-
-          this.updateIrq();
         } else if (this.index === 2) {
           this.volumeLeftToRight = val;
         } else if (this.index === 3) {
@@ -671,6 +729,12 @@ export class CdRom {
           this.seekSector = this.bcdToDec(params[2]);
           this.currentLba = (this.seekMinute * 60 + this.seekSecond) * 75 + this.seekSector - 150;
           if (this.currentLba < 0) this.currentLba = 0;
+          if (this.onLog) {
+            const minStr = this.seekMinute.toString().padStart(2, '0');
+            const secStr = this.seekSecond.toString().padStart(2, '0');
+            const frmStr = this.seekSector.toString().padStart(2, '0');
+            this.onLog('system', `CD-ROM: Set Location to ${minStr}:${secStr}:${frmStr} (LBA ${this.currentLba})`);
+          }
         }
         this.scheduleCommandResponse('Setloc', 3, [currentStatus], 12000);
         break;
@@ -678,8 +742,12 @@ export class CdRom {
       case 0x06: // ReadN
       case 0x1b: // ReadS
         if (!this.hasDisc) {
+          if (this.onLog) this.onLog('error', 'CD-ROM Read Failed: No disc mounted in drive');
           this.scheduleCommandResponse(cmdName, 5, [0x14], 15000);
         } else {
+          if (this.onLog) {
+            this.onLog('system', `CD-ROM: Start Reading Disc at LBA ${this.currentLba} (${this.isDoubleSpeed ? '2x' : '1x'} Speed, Sector Mode ${this.sectorSizeSetting}B)`);
+          }
           this.scheduleCommandResponse(cmdName, 3, [this.getStatus()], 15000, () => {
             this.isReading = true;
             this.readCyclesCountdown = this.isDoubleSpeed ? 225792 : 451584;
@@ -689,13 +757,17 @@ export class CdRom {
 
       case 0x07: // MotorOn
         this.isMotorOn = true;
-        this.scheduleCommandResponse('MotorOn', 3, [this.getStatus()], 20000);
+        this.scheduleCommandResponse('MotorOn', 3, [this.getStatus()], 20000, () => {
+          this.deliverInterrupt(2, [this.getStatus()]);
+        });
         break;
 
       case 0x08: // Stop
         this.isMotorOn = false;
         this.isReading = false;
-        this.scheduleCommandResponse('Stop', 3, [this.getStatus()], 20000);
+        this.scheduleCommandResponse('Stop', 3, [this.getStatus()], 20000, () => {
+          this.deliverInterrupt(2, [this.getStatus()]);
+        });
         break;
 
       case 0x09: // Pause
@@ -707,7 +779,9 @@ export class CdRom {
 
       case 0x0a: // Init
         this.reset();
-        this.scheduleCommandResponse('Init', 3, [this.getStatus()], 25000);
+        this.scheduleCommandResponse('Init', 3, [this.getStatus()], 25000, () => {
+          this.deliverInterrupt(2, [this.getStatus()]);
+        });
         break;
 
       case 0x0b: // Mute
@@ -771,6 +845,7 @@ export class CdRom {
         this.isSeeking = true;
         this.scheduleCommandResponse(cmdName, 3, [this.getStatus()], 15000, () => {
           this.pendingSeekCycles = 30000;
+          this.deliverInterrupt(2, [this.getStatus()]);
         });
         break;
 
@@ -778,7 +853,7 @@ export class CdRom {
         {
           const sub = params.length > 0 ? params[0] : 0x20;
           if (sub === 0x20 || params.length === 0) {
-            this.scheduleCommandResponse('Test(0x20)', 3, [0x94, 0x09, 0x19, 0xc0], 15000);
+            this.scheduleCommandResponse('Test(0x20)', 3, [0x97, 0x01, 0x10, 0xc2], 15000);
           } else {
             this.scheduleCommandResponse('Test', 3, [this.getStatus()], 12000);
           }
@@ -787,24 +862,29 @@ export class CdRom {
 
       case 0x1a: // GetID
         this.getIdCallCount++;
-        if (this.hasDisc) {
-          this.scheduleCommandResponse('GetID', 3, [0x02], 15000, () => {
-            this.deliverInterrupt(2, [0x02, 0x00, 0x20, 0x00, 0x53, 0x43, 0x45, 0x41]);
+        if (this.biosDashboardStubMode || !this.hasDisc) {
+          // In BIOS Dashboard stub mode, return INT3 0x02 followed by INT5 (No Audio/Game License error) so authentic BIOS transitions directly to 3D GUI
+          this.scheduleCommandResponse('GetID(DashboardStub)', 3, [this.getStatus()], 15000, () => {
+            this.deliverInterrupt(5, [0x08, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
           });
         } else {
-          this.scheduleCommandResponse('GetID(NoDisc)', 3, [this.getStatus()], 15000, () => {
-            this.deliverInterrupt(5, [0x08, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+          this.scheduleCommandResponse('GetID', 3, [this.getStatus()], 15000, () => {
+            this.deliverInterrupt(2, [this.getStatus(), 0x00, 0x20, 0x00, 0x53, 0x43, 0x45, 0x41]);
           });
         }
         break;
 
       case 0x1c: // Reset
         this.reset();
-        this.scheduleCommandResponse('Reset', 3, [this.getStatus()], 25000);
+        this.scheduleCommandResponse('Reset', 3, [this.getStatus()], 25000, () => {
+          this.deliverInterrupt(2, [this.getStatus()]);
+        });
         break;
 
       case 0x1e: // ReadTOC
-        this.scheduleCommandResponse('ReadTOC', 3, [this.getStatus()], 20000);
+        this.scheduleCommandResponse('ReadTOC', 3, [this.getStatus()], 20000, () => {
+          this.deliverInterrupt(2, [this.getStatus()]);
+        });
         break;
 
       default:
@@ -833,8 +913,11 @@ export class CdRom {
           userOffset = offset;
           userLen = 2352;
         } else {
-          // Standard Mode 2 Form 1 data starts at 0x18 (24 bytes)
-          userOffset = offset + 0x18;
+          // Sector Header Detection (Mode 1 vs Mode 2 Form 1)
+          const mode = (offset + 15 < this.discData.length) ? this.discData[offset + 15] : 2;
+          // Mode 1: 16-byte header, Mode 2: 24-byte header (16 sync/hdr + 8 subhdr)
+          const headerLen = (mode === 1) ? 16 : 24;
+          userOffset = offset + headerLen;
           userLen = 2048;
         }
       } else {
@@ -855,6 +938,18 @@ export class CdRom {
       }
       this.sectorBuffer.set(this.trackBuffer.subarray(0, actualLen));
       this.sectorBufferLength = actualLen;
+
+      // Clean Milestone Logging (log 1st sector, then every 100 sectors to prevent console spam)
+      if (this.sectorsReadCount === 1 || this.sectorsReadCount % 100 === 0) {
+        if (this.onLog) {
+          const totalMb = ((this.sectorsReadCount * actualLen) / (1024 * 1024)).toFixed(2);
+          this.onLog('system', `CD-ROM Streaming Data: Reading sector at LBA ${this.currentLba} | Total Streamed: ${totalMb} MB (${this.sectorsReadCount} sectors)`);
+        }
+      }
+    } else {
+      if (this.onLog) {
+        this.onLog('error', `CD-ROM Read Failed: Requested LBA ${this.currentLba} is out of bounds (Disc size: ${(this.discData.length / (1024 * 1024)).toFixed(2)} MB)`);
+      }
     }
   }
 

@@ -5,12 +5,23 @@
 
 import React, { useState, useEffect, useRef } from 'react';
 import { Ps1Emulator } from './emulator/ps1';
-import { CpuState, GpuState, EmulationStatus, ExecutionMode, BiosInfo, CdromState, ConsoleLog } from './types';
+import {
+  CpuState,
+  GpuState,
+  EmulationStatus,
+  ExecutionMode,
+  BiosInfo,
+  CdromState,
+  ConsoleLog,
+  BootMode,
+  VirtualDisc,
+} from './types';
 import { GpuCanvasView } from './components/GpuCanvasView';
 import { CpuRegistersView } from './components/CpuRegistersView';
 import { ZSNESMenuBar } from './components/ZSNESMenuBar';
 import { StarryBackground } from './components/StarryBackground';
 import { ConsoleView } from './components/ConsoleView';
+import { DualBranchControlPanel } from './components/DualBranchControlPanel';
 import { disassemble } from './emulator/disassembler';
 
 export default function App() {
@@ -28,6 +39,7 @@ export default function App() {
   const [cpuState, setCpuState] = useState<CpuState>(() => emu.cpu.getState());
   const [gpuState, setGpuState] = useState<GpuState>(() => emu.gpu.getState());
   const [cdromState, setCdromState] = useState<CdromState>(() => emu.getCdromState());
+  const [mountedDisc, setMountedDisc] = useState<VirtualDisc | null>(() => emu.mountedDisc);
   const [status, setStatus] = useState<EmulationStatus>(emu.status);
   const [mode, setMode] = useState<ExecutionMode>(emu.mode);
   const [speedMultiplier, setSpeedMultiplier] = useState<number>(emu.speedMultiplier);
@@ -53,6 +65,7 @@ export default function App() {
       setIps(emu.currentIps);
       setHasBiosLoaded(emu.hasBiosLoaded);
       setBiosInfo(emu.currentBiosInfo);
+      setMountedDisc(emu.mountedDisc);
       if (newCdrom) {
         setCdromState(newCdrom);
       }
@@ -136,22 +149,49 @@ export default function App() {
     setStatus(emu.status);
   };
 
-  // Handle Game Disc Mount
-  const handleMountDisc = (fileBuffer: ArrayBuffer, fileName: string) => {
+  // Handle Game Disc or ZIP Archive Mount
+  const handleMountDiscOrArchive = async (file: File) => {
     try {
-      emu.mountDisc(fileBuffer, fileName);
+      const disc = await emu.mountArchive(file, file.name);
+      setMountedDisc(disc);
       setCdromState(emu.getCdromState());
       setCpuState(emu.cpu.getState());
       setGpuState(emu.gpu.getState());
       setStatus(emu.status);
     } catch (err: any) {
-      alert(`Failed to mount disc: ${err.message || err}`);
+      alert(`Failed to mount media archive: ${err.message || err}`);
     }
   };
 
   const handleEjectDisc = () => {
     emu.ejectDisc();
+    setMountedDisc(null);
     setCdromState(emu.getCdromState());
+    setCpuState(emu.cpu.getState());
+    setStatus(emu.status);
+  };
+
+  // Dual Branch Boot Dispatchers
+  const handleBootBios = () => {
+    if (emu.cdrom.hasDisc) {
+      alert('Branch A (Authentic BIOS) is locked while a disc/archive is mounted. Please eject media first.');
+      return;
+    }
+    emu.boot(BootMode.BIOS_DASHBOARD);
+    setCpuState(emu.cpu.getState());
+    setGpuState(emu.gpu.getState());
+    setStatus(emu.status);
+  };
+
+  const handleLaunchGame = () => {
+    if (!emu.cdrom.hasDisc || !emu.mountedDisc) {
+      alert('Branch B (Fast-Boot HLE) requires a mounted disc image or ZIP archive.');
+      return;
+    }
+    emu.boot(BootMode.HLE_GAME_RUNNER, emu.mountedDisc);
+    setCpuState(emu.cpu.getState());
+    setGpuState(emu.gpu.getState());
+    setStatus(emu.status);
   };
 
   const handleBiosFileInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -165,7 +205,7 @@ export default function App() {
   const handleDiscFileInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files.length > 0) {
       const file = e.target.files[0];
-      file.arrayBuffer().then((buf) => handleMountDisc(buf, file.name));
+      handleMountDiscOrArchive(file);
       e.target.value = '';
     }
   };
@@ -179,8 +219,12 @@ export default function App() {
   };
 
   const handleRun = () => {
-    emu.start();
-    setStatus(emu.status);
+    if (emu.cdrom.hasDisc && emu.mountedDisc) {
+      handleLaunchGame();
+    } else {
+      emu.start();
+      setStatus(emu.status);
+    }
   };
 
   const handlePause = () => {
@@ -200,9 +244,13 @@ export default function App() {
     setCpuState(emu.cpu.getState());
     setGpuState(emu.gpu.getState());
     setStatus(emu.status);
-    if (emu.hasBiosLoaded) {
-      emu.start();
-    }
+  };
+
+  const handleRunTest = (testId: string) => {
+    emu.runHardwareTest(testId);
+    setCpuState(emu.cpu.getState());
+    setGpuState(emu.gpu.getState());
+    setStatus(emu.status);
   };
 
   const handleModeChange = (newMode: ExecutionMode) => {
@@ -229,7 +277,26 @@ export default function App() {
 
     switch (cmd) {
       case 'help':
-        emu.addLog('system', 'Available commands: dumpstatus, run, pause, step, reset, pc, regs, bios, disc, clear, cls, speed <n>, mode <hybrid|jit|interpreter>, disasm <hex_addr>, dump <hex_addr>');
+        emu.addLog('system', 'Available commands: bootbios, launchgame, eject, test <id>, dumpstatus, run, pause, step, reset, pc, regs, bios, disc, clear, cls, speed <n>, mode <hybrid|jit|interpreter>');
+        break;
+      case 'bootbios':
+      case 'biosboot':
+        handleBootBios();
+        break;
+      case 'launchgame':
+      case 'fastboot':
+        handleLaunchGame();
+        break;
+      case 'eject':
+        handleEjectDisc();
+        break;
+      case 'test':
+      case 'tests':
+        if (arg1) {
+          handleRunTest(arg1);
+        } else {
+          handleRunTest('gpu_poly_anim');
+        }
         break;
       case 'dumpstatus':
       case 'dumpstatus()':
@@ -269,7 +336,7 @@ export default function App() {
         break;
       case 'disc':
         if (emu.cdrom.hasDisc) {
-          emu.addLog('system', `Disc: ${emu.cdrom.discInfo?.name || 'Mounted'} (${emu.cdrom.discInfo?.sectors || 0} sectors)`);
+          emu.addLog('system', `Disc: ${emu.cdrom.discInfo?.name || 'Mounted'} (${emu.cdrom.discInfo?.totalSectors || 0} sectors)`);
         } else {
           emu.addLog('system', 'CD-ROM drive tray is empty.');
         }
@@ -301,18 +368,6 @@ export default function App() {
         }
         break;
       }
-      case 'dump': {
-        const addr = arg1 ? parseInt(arg1, 16) : emu.cpu.pc;
-        if (!isNaN(addr)) {
-          let line = `0x${addr.toString(16).toUpperCase().padStart(8, '0')}: `;
-          for (let i = 0; i < 16; i++) {
-            const b = emu.memory.read8((addr + i) >>> 0);
-            line += b.toString(16).padStart(2, '0').toUpperCase() + ' ';
-          }
-          emu.addLog('system', line);
-        }
-        break;
-      }
       default:
         emu.addLog('warn', `Unknown command "${cmd}". Type 'help' for available commands.`);
         break;
@@ -335,8 +390,16 @@ export default function App() {
     if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
       const file = e.dataTransfer.files[0];
       const lower = file.name.toLowerCase();
-      if (lower.endsWith('.iso') || lower.endsWith('.cue') || lower.endsWith('.img') || file.size > 524288) {
-        file.arrayBuffer().then((buf) => handleMountDisc(buf, file.name));
+      if (
+        lower.endsWith('.zip') ||
+        lower.endsWith('.iso') ||
+        lower.endsWith('.cue') ||
+        lower.endsWith('.bin') ||
+        lower.endsWith('.img') ||
+        lower.endsWith('.exe') ||
+        file.size > 524288
+      ) {
+        handleMountDiscOrArchive(file);
       } else {
         handleLoadBiosFile(file);
       }
@@ -351,7 +414,7 @@ export default function App() {
       onDrop={handleDrop}
       className="h-screen w-screen max-h-screen max-w-screen bg-[#111116] text-zinc-200 flex flex-col p-1 sm:p-2 font-sans select-none overflow-hidden"
     >
-      {/* Hidden File Inputs for BIOS and Disc */}
+      {/* Hidden File Inputs for BIOS and Disc/ZIP */}
       <input
         ref={biosFileInputRef}
         type="file"
@@ -362,12 +425,12 @@ export default function App() {
       <input
         ref={discFileInputRef}
         type="file"
-        accept=".iso,.bin,.cue,.img,.exe,*"
+        accept=".zip,.iso,.bin,.cue,.img,.exe,*"
         className="hidden"
         onChange={handleDiscFileInputChange}
       />
 
-      {/* Retro Emulator Window Container - Expands to full available window */}
+      {/* Retro Emulator Window Container */}
       <div
         id="zsnes-emulator-window"
         className="w-full h-full rounded-md border-2 border-[#828296] bg-[#1a1a24] shadow-2xl flex flex-col overflow-hidden min-h-0"
@@ -386,7 +449,7 @@ export default function App() {
               -
             </span>
             <span className="tracking-wide text-zinc-900 drop-shadow-xs">
-              SPC PS1 Emulator V0.1 | made with gemini
+              SPC PS1 Emulator | Dual-Branch Architecture
             </span>
           </div>
 
@@ -427,10 +490,13 @@ export default function App() {
           onUnloadBios={handleUnloadBios}
           onOpenMountDisc={handleOpenMountDisc}
           onEjectDisc={handleEjectDisc}
+          onBootBios={handleBootBios}
+          onLaunchGame={handleLaunchGame}
           onRun={handleRun}
           onPause={handlePause}
           onStep={handleStep}
           onReset={handleReset}
+          onRunTest={handleRunTest}
           onModeChange={handleModeChange}
           onSpeedChange={handleSpeedChange}
           onToggleScanlines={() => setScanlines(!scanlines)}
@@ -440,10 +506,31 @@ export default function App() {
           onDumpStatus={() => emu.dumpStatus()}
         />
 
+        {/* Dual Branch Control Panel */}
+        <div className="px-2 pt-1.5 shrink-0">
+          <DualBranchControlPanel
+            hasBiosLoaded={hasBiosLoaded}
+            biosInfo={biosInfo}
+            hasDiscLoaded={cdromState.hasDisc}
+            mountedDisc={mountedDisc}
+            discName={cdromState.discInfo?.name}
+            status={status}
+            onBootBios={handleBootBios}
+            onLaunchGame={handleLaunchGame}
+            onOpenLoadBios={handleOpenLoadBios}
+            onUnloadBios={handleUnloadBios}
+            onOpenMountDisc={handleOpenMountDisc}
+            onEjectDisc={handleEjectDisc}
+            onPause={handlePause}
+            onStep={handleStep}
+            onReset={handleReset}
+          />
+        </div>
+
         {/* Main Emulator Viewport: Retro Starry Background Canvas */}
         <div className="relative flex-1 min-h-0 w-full bg-[#2c1e54] flex flex-col justify-center items-center overflow-hidden">
           <StarryBackground>
-            <div className="flex flex-col items-center justify-center p-2 sm:p-4 w-full h-full max-h-full">
+            <div className="flex flex-col items-center justify-center p-2 sm:p-3 w-full h-full max-h-full">
               {/* PS1 CRT Display Monitor */}
               <GpuCanvasView
                 gpu={emu.gpu}
@@ -454,8 +541,12 @@ export default function App() {
                 hasBiosLoaded={hasBiosLoaded}
                 onOpenLoadBios={handleOpenLoadBios}
                 onOpenMountDisc={handleOpenMountDisc}
+                onBootBios={handleBootBios}
+                onLaunchGame={handleLaunchGame}
+                onEjectDisc={handleEjectDisc}
                 hasDiscLoaded={cdromState.hasDisc}
                 discName={cdromState.discInfo?.name}
+                mountedDisc={mountedDisc}
               />
             </div>
           </StarryBackground>
@@ -463,8 +554,8 @@ export default function App() {
           {/* Drag & Drop Overlay Notice */}
           {isDragging && (
             <div className="absolute inset-0 bg-blue-950/85 backdrop-blur-xs border-4 border-dashed border-blue-400 flex flex-col items-center justify-center text-white z-40">
-              <span className="text-lg font-bold font-mono">Drop 512KB BIOS ROM or Game Disc (.ISO / .BIN)</span>
-              <span className="text-xs font-mono text-zinc-300 mt-1">Authentic Sony PS1 dumps automatically mounted</span>
+              <span className="text-lg font-bold font-mono">Drop ZIP Archive, Disc (.BIN/.CUE/.ISO), or 512KB BIOS ROM</span>
+              <span className="text-xs font-mono text-zinc-300 mt-1">Automatic ZIP decompression and direct executable extraction</span>
             </div>
           )}
         </div>
@@ -491,3 +582,4 @@ export default function App() {
     </div>
   );
 }
+

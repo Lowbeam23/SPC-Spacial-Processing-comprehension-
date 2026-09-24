@@ -10,8 +10,32 @@ import { Gpu } from './gpu';
 import { CdRom, PsxExeHeader } from './cdrom';
 import { BiosManager } from './bios';
 import { saveBiosToStorage, loadBiosFromStorage, deleteBiosFromStorage } from './biosStorage';
-import { ExecutionMode, EmulationStatus, ConsoleLog, BiosInfo, CpuState, GpuState, CdromState } from '../types';
+import {
+  ExecutionMode,
+  EmulationStatus,
+  ConsoleLog,
+  BiosInfo,
+  CpuState,
+  GpuState,
+  CdromState,
+  BootMode,
+  VirtualDisc,
+  ParsedExecutable,
+} from '../types';
+import { mountArchiveOrDisc, extractExecutableFromDisc } from './discMount';
 import { disassemble } from './disassembler';
+import {
+  TEST_SUITES,
+  generateGpuPolyAnimTest,
+  generateGteProjectionTest,
+  generateGpuStressBenchmark,
+  generateBlendModesTest,
+  generateCpuDmaBenchmark,
+  generateSpuSynthTest,
+  generateCdromHardwareTest,
+  createSyntheticCdromTestDisc,
+} from './tests';
+import { SpuAudioBackend } from './spu';
 
 export class Ps1Emulator {
   public memory: Memory;
@@ -19,12 +43,15 @@ export class Ps1Emulator {
   public recompiler: Recompiler;
   public gpu: Gpu;
   public cdrom: CdRom;
+  public audioBackend: SpuAudioBackend;
 
   public status: EmulationStatus = 'stopped';
   public mode: ExecutionMode = 'interpreter'; // Interpreter default for 100% exact compliance
   public speedMultiplier: number = 1.0;
   public isFastBoot: boolean = true;
   public hasBiosLoaded: boolean = false;
+  public hleBiosEnabled: boolean = false;
+  public mountedDisc: VirtualDisc | null = null;
   public currentBiosInfo: BiosInfo | null = null;
   public lastError: string | null = null;
 
@@ -101,6 +128,9 @@ export class Ps1Emulator {
     this.cdrom.onActivity = () => {
       this.cyclesSinceCdromOrDma = 0;
     };
+    this.cdrom.onDmaRequest = () => {
+      this.memory.checkDmaCdrom();
+    };
     this.memory.onDmaActivity = () => {
       this.cyclesSinceCdromOrDma = 0;
     };
@@ -115,10 +145,20 @@ export class Ps1Emulator {
     this.gpu = new Gpu();
     this.memory.gpu = this.gpu;
 
+    // SPU Web Audio Driver
+    this.audioBackend = new SpuAudioBackend();
+    this.audioBackend.init(this.memory.spu);
+
     // Hook coarse cycle flushing to peripheral advancer
     this.memory.onFlushCycles = (cycles) => this.advanceCycles(cycles);
 
     // Hook memory to GPU
+    this.gpu.onTriggerIrq = () => {
+      this.memory.triggerInterrupt(1);
+    };
+    this.gpu.onAcknowledgeIrq = () => {
+      this.memory.writeIStat(this.memory.iStat & ~(1 << 1));
+    };
     this.memory.gpuReadHandler = () => this.gpu.readGpu();
     this.memory.gpuStatHandler = () => this.gpu.readStat();
     this.memory.gpuWriteHandler = (val) => this.gpu.sendGp0(val);
@@ -139,6 +179,13 @@ export class Ps1Emulator {
     this.gpu.onBootBenchmark = () => {
       this.handleBootBenchmarkTrigger();
     };
+
+    // Hook GTE diagnostic logs
+    if (this.cpu && this.cpu.gte) {
+      this.cpu.gte.onDiagnostic = (msg) => {
+        this.addLog('gte', `[GTE] ${msg}`);
+      };
+    }
 
     // Hook CPU errors so they are NEVER hidden
     this.cpu.onError = (err, pc, opcode) => {
@@ -235,38 +282,59 @@ export class Ps1Emulator {
   /**
    * Separate Game Disc Mount:
    * Passes game or homebrew image directly to CD-ROM controller.
-   * Resets CPU to 0xBFC00000 to execute the authentic BIOS with the disc inserted.
    */
   public mountDisc(fileBuffer: ArrayBuffer | Uint8Array, fileName: string = 'game.iso'): void {
-    const info = this.cdrom.mountDisc(fileBuffer, fileName);
+    const bytes = fileBuffer instanceof ArrayBuffer ? new Uint8Array(fileBuffer) : fileBuffer;
+    const sectorSize = bytes.length % 2352 === 0 ? 2352 : 2048;
+    const totalSectors = Math.floor(bytes.length / sectorSize);
+    const disc: VirtualDisc = {
+      name: fileName,
+      buffer: bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
+      data: bytes,
+      sectorSize,
+      totalSectors,
+      primaryExecutable: fileName.toLowerCase().endsWith('.exe') ? fileName : 'PSX.EXE',
+      volumeLabel: 'PlayStation Disc',
+    };
+    this.mountedDisc = disc;
+    const info = this.cdrom.mount(disc);
     this.cdrom.hasDisc = true;
     this.memory.hasDiscLoaded = true;
 
-    this.reset();
     const mountMsg = `Game Disc Mounted: "${info.name}" (${(info.size / (1024 * 1024)).toFixed(2)} MB, ${info.type.toUpperCase()}). Format: ${info.sectorSize}B sectors (${info.totalSectors.toLocaleString()} total).`;
     this.addLog('system', mountMsg);
     this.recordRelevantEvent('CD-ROM', mountMsg);
     if (info.volumeLabel) {
       this.addLog('system', `Volume Label: "${info.volumeLabel}" | Executable: "${info.executableName || 'PSX.EXE'}"`);
     }
-
-    if (this.hasBiosLoaded) {
-      this.addLog('bios', `System reset to 0xBFC00000. Booting authentic BIOS with disc inserted in drive.`);
-      this.start();
-    } else {
-      this.addLog('warn', 'Disc mounted in CD-ROM drive. Please load a 512KB PS1 BIOS ROM to begin.');
-      this.notifyState();
-    }
+    this.notifyState();
   }
 
   /**
-   * Ejects the current game disc from the CD-ROM drive tray.
+   * Mounts a ZIP archive or raw disc file and prepares VirtualDisc structure.
+   */
+  public async mountArchive(fileOrBuffer: File | ArrayBuffer | Uint8Array, fileName: string = 'disc.zip'): Promise<VirtualDisc> {
+    const disc = await mountArchiveOrDisc(fileOrBuffer, fileName);
+    this.mountedDisc = disc;
+    this.cdrom.mount(disc);
+    this.memory.hasDiscLoaded = true;
+
+    const mountMsg = `Mounted Media: "${disc.name}" (${(disc.data.length / (1024 * 1024)).toFixed(2)} MB, ${disc.sectorSize}B/sector). Sectors: ${disc.totalSectors.toLocaleString()}. Executable: ${disc.primaryExecutable || 'PSX.EXE'}`;
+    this.addLog('system', mountMsg);
+    this.recordRelevantEvent('CD-ROM', mountMsg);
+    this.notifyState();
+    return disc;
+  }
+
+  /**
+   * Ejects the current game disc from the CD-ROM drive tray and clears mounted buffers.
    */
   public ejectDisc(): void {
+    this.mountedDisc = null;
     this.cdrom.ejectDisc();
     this.memory.hasDiscLoaded = false;
-    this.addLog('system', 'CD-ROM Drive: Tray opened (Disc ejected).');
-    this.recordRelevantEvent('CD-ROM', 'Disc ejected from drive tray.');
+    this.addLog('system', 'CD-ROM Drive: Tray opened (Media ejected / cleared).');
+    this.recordRelevantEvent('CD-ROM', 'Media ejected from drive tray.');
     this.notifyState();
   }
 
@@ -283,7 +351,11 @@ export class Ps1Emulator {
 
   private _bootLogged: boolean = false;
 
-  public reset(): void {
+  /**
+   * Mandatory Cold Reset & Hardware State Purge:
+   * Wipes 2MB RAM, clears CPU registers, resets DMA & Timers, GPU, SPU, and Recompiler.
+   */
+  public hardReset(): void {
     this.pause();
     this.lastError = null;
     this.isFastBoot = true;
@@ -294,22 +366,245 @@ export class Ps1Emulator {
     this.totalCycles = 0;
     this.hasLogged500kTotal = false;
     this.hasLogged500kPostLaunch = false;
+
+    // 1. Wipe 2MB RAM completely
+    this.memory.ram.fill(0);
+    this.memory.scratchpad.fill(0);
+    this.memory.io.fill(0);
     this.memory.reset();
+
+    // 2. Reset CD-ROM controller hardware
     if (this.cdrom) {
       this.cdrom.reset();
       this.memory.hasDiscLoaded = this.cdrom.hasDisc;
     }
+
+    // 3. Clear CPU registers & state, ensure HLE vectors are completely unregistered
+    this.hleBiosEnabled = false;
     this.cpu.reset();
+    this.cpu.hleBiosEnabled = false;
+
+    // 4. Reset GPU, DMA, Timers & Recompiler Cache
     this.gpu.reset();
+    this.memory.timersCtrl.reset();
+    this.memory.dma.reset();
     this.recompiler.clearCache();
+
     this.vblankCycleCounter = 0;
     this.cyclesSinceCdromOrDma = 0;
     this.lastStallLogCycles = 0;
     this.logoLoopFramesAfterDma2 = 0;
     this.status = 'stopped';
     this.notifyState();
+  }
+
+  public reset(): void {
+    this.hardReset();
     this.addLog('system', 'System Reset: CPU registers cleared, PC = 0xBFC00000');
     this.recordRelevantEvent('SYSTEM', 'System Reset: CPU registers cleared, PC = 0xBFC00000');
+  }
+
+  /**
+   * Dual-Branch Boot Architecture:
+   * Branch A (Authentic BIOS / Dashboard): Runs Sony BIOS ROM from 0xBFC00000 with BEV=1.
+   * Branch B (Fast-Boot / HLE Game Runner): Boots commercial PS1 games directly into RAM using HLE BIOS jump tables.
+   */
+  public boot(mode?: BootMode, discData?: VirtualDisc): void {
+    const targetMode = mode || (this.mountedDisc ? BootMode.HLE_GAME_RUNNER : BootMode.BIOS_DASHBOARD);
+    const targetDisc = discData || this.mountedDisc || undefined;
+
+    // 1. Mandatory Cold Reset & Hardware State Purge
+    this.hardReset();
+
+    if (targetMode === BootMode.BIOS_DASHBOARD) {
+      // Branch A: Authentic BIOS ROM Path (Direct Dashboard / 3D GUI / CD Player)
+      this.hleBiosEnabled = false;
+      this.cpu.hleBiosEnabled = false;
+      this.cdrom.biosDashboardStubMode = true; // Tricked into idle disc drive stub so authentic BIOS passes hardware tests directly into 3D GUI
+      this.cpu.cop0.status.bev = 1; // Bootstrap Exception Vector in ROM (0xBFC00180)
+      this.cpu.pc = 0xbfc00000;
+      this.cpu.nextPc = 0xbfc00004;
+
+      console.log('[BOOT] Starting Authentic BIOS ROM from 0xBFC00000');
+      this.addLog('bios', 'Starting Authentic BIOS ROM from 0xBFC00000 (Branch A: Clean Slate - Real Sony ROM handles all vectors natively)');
+      this.recordRelevantEvent('BOOT', 'Branch A: Authentic BIOS ROM from 0xBFC00000');
+
+      if (!this.hasBiosLoaded) {
+        this.addLog('warn', 'No BIOS ROM loaded. Please load an authentic 512KB PS1 BIOS ROM.');
+        this.notifyState();
+        return;
+      }
+      this.start();
+    } else if (targetMode === BootMode.HLE_GAME_RUNNER && targetDisc) {
+      // Branch B: Direct HLE Game Runner Path (Real Game Disc Drive)
+      this.hleBiosEnabled = true;
+      this.cpu.hleBiosEnabled = true;
+      this.cdrom.biosDashboardStubMode = false; // Real CD-ROM drive mode for games
+      this.mountedDisc = targetDisc;
+      this.cdrom.mount(targetDisc);
+      this.memory.hasDiscLoaded = true;
+
+      // Parse EXE header & preload binary payload directly to ram[loadAddr]
+      const exe = this.extractExecutable(targetDisc);
+      if (exe.data && exe.data.length > 0) {
+        this.memory.writeBuffer(exe.loadAddr, exe.data);
+      }
+
+      // Zero-fill BSS area if present
+      if (exe.bssSize && exe.bssSize > 0 && exe.bssAddr) {
+        for (let i = 0; i < exe.bssSize; i += 4) {
+          this.memory.write32((exe.bssAddr + i) >>> 0, 0);
+        }
+      }
+
+      // Determine safe Stack Pointer
+      let targetSp = exe.initialSp;
+      if (!targetSp || targetSp < 0x80000000 || targetSp >= 0x80200000) {
+        targetSp = 0x801ffff0;
+      }
+
+      // Initialize CPU registers according to PS-X EXE header requirements
+      this.cpu.pc = exe.entryPc >>> 0;
+      this.cpu.nextPc = (exe.entryPc + 4) >>> 0;
+      this.cpu.setReg(29, targetSp >>> 0); // $sp (R29)
+      this.cpu.setReg(30, targetSp >>> 0); // $fp (R30)
+      this.cpu.setReg(28, (exe.initialGp || 0x00000000) >>> 0); // $gp (R28)
+      this.cpu.setReg(31, 0x800000b0); // $ra (R31) pointing to safe B0 vector space
+      this.cpu.setReg(4, 1); // $a0 (R4) argc = 1
+      this.cpu.setReg(5, 0x80000180); // $a1 (R5) argv pointer
+
+      // Write basic argv string at 0x80000180 in RAM ("cdrom:\\")
+      this.memory.write32(0x80000180, 0x80000188); // argv[0] -> 0x80000188
+      const cdromArgvStr = new TextEncoder().encode('cdrom:\\\0');
+      this.memory.writeBuffer(0x80000188, cdromArgvStr);
+
+      // COP0 Status & Global Interrupt Enable:
+      // Bit 0 (IEc) = 1 (Interrupt Enable current)
+      // Bit 10 (IM2) = 1 (Enable IP2 hardware peripheral IRQs: CD-ROM, GPU, DMA, SPU, Timers)
+      // Bit 22 (BEV) = 0 (Route exceptions through RAM vector 0x80000080)
+      this.cpu.cop0Regs[12] = 0x00000401; // IM2 | IEc
+      this.cpu.cop0.status.bev = 0;
+      this.cpu.cop0.status.iec = 1;
+
+      // Ensure motherboard I_MASK register (0x1F801074) enables peripheral IRQs
+      if (this.memory.iMask === 0) {
+        this.memory.iMask = 0x001d; // Bit 2 (CD-ROM), Bit 0 (VBLANK), Bit 3 (DMA), Bit 4 (Timers)
+      }
+
+      // Install minimal low-RAM trampolines and enable HLE syscall trap handler
+      this.installHleJumpTables();
+      this.hasLoggedExecutableLaunch = true;
+
+      const logMsg = `[BOOT] Fast-Boot HLE Launch: Entry PC=0x${exe.entryPc.toString(16).toUpperCase()} Load=0x${exe.loadAddr.toString(16).toUpperCase()} Size=${exe.data.length.toLocaleString()} bytes`;
+      console.log(logMsg);
+      this.addLog('system', logMsg, exe.entryPc);
+      this.recordRelevantEvent('BOOT', `Branch B: Fast-Boot HLE Launch (Entry PC=0x${exe.entryPc.toString(16).toUpperCase()})`);
+      this.start();
+    } else {
+      this.addLog('warn', 'Branch B requires a mounted disc or ZIP archive.');
+      this.notifyState();
+    }
+  }
+
+  /**
+   * Extracts executable machine code and execution vectors from a VirtualDisc.
+   */
+  public extractExecutable(discData: VirtualDisc): ParsedExecutable {
+    return extractExecutableFromDisc(discData);
+  }
+
+  /**
+   * Installs minimal low-RAM trampolines and kernel vector tables for HLE mode.
+   */
+  public installHleJumpTables(): void {
+    // 1. Install standard PS1 kernel A0, B0, C0 low-RAM vector table stubs in low RAM
+    // For A0 (0x000000A0): JR $RA / NOP
+    this.memory.write32(0x000000a0, 0x03e00008); // jr $ra
+    this.memory.write32(0x000000a4, 0x00000000); // nop
+
+    // For B0 (0x000000B0): JR $RA / NOP
+    this.memory.write32(0x000000b0, 0x03e00008); // jr $ra
+    this.memory.write32(0x000000b4, 0x00000000); // nop
+
+    // For C0 (0x000000C0): JR $RA / NOP
+    this.memory.write32(0x000000c0, 0x03e00008); // jr $ra
+    this.memory.write32(0x000000c4, 0x00000000); // nop
+
+    // 2. Install General Exception Vector at 0x80000080
+    // Differentiates Hardware Interrupts (ExcCode 0, do NOT increment EPC)
+    // from SYSCALL/Break exceptions (ExcCode != 0, increment EPC by 4).
+    // Acknowledges / clears I_STAT via 0xBF801070 for hardware interrupts before returning.
+    this.memory.write32(0x80000080, 0x401a7000); // mfc0 $k0, $14 (EPC)
+    this.memory.write32(0x80000084, 0x401b6800); // mfc0 $k1, $13 (Cause)
+    this.memory.write32(0x80000088, 0x337b007c); // andi $k1, $k1, 0x007c (ExcCode)
+    this.memory.write32(0x8000008c, 0x13600004); // beq $k1, $zero, +4 (If Hardware Int ExcCode 0, jump to 0x800000a0 to clear I_STAT)
+    this.memory.write32(0x80000090, 0x00000000); // nop (delay slot)
+    this.memory.write32(0x80000094, 0x275a0004); // addiu $k0, $k0, 4 (Advance EPC for SYSCALL/Break)
+    this.memory.write32(0x80000098, 0x10000003); // b +3 (Jump over hardware int clear to 0x800000a8)
+    this.memory.write32(0x8000009c, 0x00000000); // nop (delay slot)
+    // Hardware Int handling: clear I_STAT
+    this.memory.write32(0x800000a0, 0x3c1bbf80); // lui $k1, 0xbf80
+    this.memory.write32(0x800000a4, 0xaf601070); // sw $zero, 0x1070($k1)
+    // Common exit
+    this.memory.write32(0x800000a8, 0x409a7000); // mtc0 $k0, $14 (Save EPC)
+    this.memory.write32(0x800000ac, 0x42000010); // rfe (Restore Status bits: IEp -> IEc)
+    this.memory.write32(0x800000b0, 0x03400008); // jr $k0 (Return to interrupted instruction)
+    this.memory.write32(0x800000b4, 0x00000000); // nop (delay slot)
+
+    // 3. Initialize kernel Event descriptor tables in RAM (0x00000100 - 0x00000200)
+    // Event 0: VBLANK (Class 0xF0000001, Spec 0x00000004, Mode/Status 0x00001000 = Ready)
+    this.memory.write32(0x00000100, 0xf0000001);
+    this.memory.write32(0x00000104, 0x00000004);
+    this.memory.write32(0x00000108, 0x00001000);
+    this.memory.write32(0x0000010c, 0x00000000);
+
+    // Event 1: CD-ROM (Class 0xF0000003, Spec 0x00000010, Mode/Status 0x00001000 = Ready)
+    this.memory.write32(0x00000110, 0xf0000003);
+    this.memory.write32(0x00000114, 0x00000010);
+    this.memory.write32(0x00000118, 0x00001000);
+    this.memory.write32(0x0000011c, 0x00000000);
+
+    // Event 2: DMA (Class 0xF0000002, Spec 0x00000008, Mode/Status 0x00001000 = Ready)
+    this.memory.write32(0x00000120, 0xf0000002);
+    this.memory.write32(0x00000124, 0x00000008);
+    this.memory.write32(0x00000128, 0x00001000);
+    this.memory.write32(0x0000012c, 0x00000000);
+
+    // Event 3: Timer (Class 0xF0000004, Spec 0x00000020, Mode/Status 0x00001000 = Ready)
+    this.memory.write32(0x00000130, 0xf0000004);
+    this.memory.write32(0x00000134, 0x00000020);
+    this.memory.write32(0x00000138, 0x00001000);
+    this.memory.write32(0x0000013c, 0x00000000);
+
+    // Event 4: GPU (Class 0xF0000001, Spec 0x00000002, Mode/Status 0x00001000 = Ready)
+    this.memory.write32(0x00000140, 0xf0000001);
+    this.memory.write32(0x00000144, 0x00000002);
+    this.memory.write32(0x00000148, 0x00001000);
+    this.memory.write32(0x0000014c, 0x00000000);
+
+    // 4. Mirror Exception Handler to BIOS ROM area (0xBFC00180) if available
+    if (this.memory.bios && this.memory.bios.length >= 0x80000) {
+      const bios = this.memory.bios;
+      const view = new DataView(bios.buffer, bios.byteOffset, bios.byteLength);
+      view.setUint32(0x180, 0x401a7000, true); // mfc0 $k0, $14 (EPC)
+      view.setUint32(0x184, 0x401b6800, true); // mfc0 $k1, $13 (Cause)
+      view.setUint32(0x188, 0x337b007c, true); // andi $k1, $k1, 0x007c (ExcCode)
+      view.setUint32(0x18c, 0x13600004, true); // beq $k1, $zero, +4
+      view.setUint32(0x190, 0x00000000, true); // nop
+      view.setUint32(0x194, 0x275a0004, true); // addiu $k0, $k0, 4
+      view.setUint32(0x198, 0x10000003, true); // b +3
+      view.setUint32(0x19c, 0x00000000, true); // nop
+      view.setUint32(0x1a0, 0x3c1bbf80, true); // lui $k1, 0xbf80
+      view.setUint32(0x1a4, 0xaf601070, true); // sw $zero, 0x1070($k1)
+      view.setUint32(0x1a8, 0x409a7000, true); // mtc0 $k0, $14
+      view.setUint32(0x1ac, 0x42000010, true); // rfe
+      view.setUint32(0x1b0, 0x03400008, true); // jr $k0
+      view.setUint32(0x1b4, 0x00000000, true); // nop
+    }
+
+    // 5. Invalidate JIT / Recompiler cache for low RAM vectors
+    this.recompiler.invalidateAddress(0x00000000, 0x1000);
+    this.recompiler.invalidateAddress(0x80000000, 0x1000);
   }
 
   public setFastBoot(enable: boolean): void {
@@ -396,12 +691,6 @@ export class Ps1Emulator {
     }
   }
 
-  public boot(): void {
-    this.reset();
-    this.addLog('bios', `Booting PS1 MIPS R3000A from reset vector 0x${this.cpu.pc.toString(16).toUpperCase()}...`);
-    this.start();
-  }
-
   public setExecutionMode(mode: ExecutionMode): void {
     this.mode = mode;
     this.addLog('system', `Execution mode switched to: ${mode.toUpperCase()} ${mode === 'hybrid' ? '(JIT with Interpreter Fallback)' : ''}`);
@@ -421,7 +710,7 @@ export class Ps1Emulator {
 
   public start(): void {
     if (this.status === 'running') return;
-    if (!this.hasBiosLoaded) {
+    if (!this.hasBiosLoaded && !this.hasLoggedExecutableLaunch) {
       this.status = 'stopped';
       this.addLog('warn', 'Please load a 512KB PS1 BIOS ROM to begin.');
       this.notifyState();
@@ -441,6 +730,7 @@ export class Ps1Emulator {
     this.gpu.debugLogging = false;
     this.memory.debugLogging = false;
     this.cpu.onInstruction = undefined;
+    this.audioBackend.resume();
     this.addLog('system', `Emulator running (Mode: ${this.mode.toUpperCase()}, PC: 0x${this.cpu.pc.toString(16).toUpperCase()})`);
     this.loop();
   }
@@ -557,6 +847,10 @@ export class Ps1Emulator {
       this.cpu.regs[29] = sp;
       this.cpu.regs[30] = sp; // Frame pointer $fp
 
+      if (this.memory.iMask === 0) {
+        this.memory.iMask = 0x001f; // Unmask VBLANK, GPU, CD-ROM, DMA, Timers
+      }
+
       // Invalidate recompiler JIT cache so newly populated code is compiled
       this.recompiler.clearCache();
 
@@ -613,12 +907,22 @@ export class Ps1Emulator {
     const dispY = this.gpu.displayVramY;
     const hasPixels = totalVramNonZero > 0;
     const displayPixelsExist = displayNonZero > 0;
+    const gp0Count = this.gpu.gp0WriteCount;
+    const gp1Count = this.gpu.gp1WriteCount;
+    const dma2Count = this.gpu.dma2PacketCount;
+    const vblankCount = this.gpu.vblankIrqCount;
+    const iStatHex = `0x${(this.memory.iStat & 0xffff).toString(16).padStart(4, '0').toUpperCase()}`;
+    const iMaskHex = `0x${(this.memory.iMask & 0xffff).toString(16).padStart(4, '0').toUpperCase()}`;
+    const srHex = `0x${(this.cpu.cop0Regs[12] >>> 0).toString(16).padStart(8, '0').toUpperCase()}`;
+    const iec = this.cpu.cop0Regs[12] & 1;
 
     const events = this.recentRelevantEvents.slice(-10);
 
     const lines: string[] = [
       '======================== [PS1 STATUS DUMP] ========================',
       `Current PC: ${pcHex}`,
+      `GPU Writes: GP0(0x1F801810)=${gp0Count.toLocaleString()} | GP1(0x1F801814)=${gp1Count.toLocaleString()} | DMA2 Packets=${dma2Count.toLocaleString()}`,
+      `VBLANK Interrupts: ${vblankCount.toLocaleString()} ticks | I_STAT: ${iStatHex} | I_MASK: ${iMaskHex} | SR: ${srHex} (IEc=${iec})`,
       `Pixels Exist in VRAM: ${hasPixels ? 'YES' : 'NO'} (Total non-zero pixels in 1MB VRAM: ${totalVramNonZero.toLocaleString()})`,
       `Active Display Viewport: (${dispX},${dispY}) @ ${dispW}x${dispH} | Viewport non-zero pixels: ${displayNonZero.toLocaleString()} | Blanked: ${this.gpu.displayDisabled ? 'YES' : 'NO'}`,
       `Total GP0 Draw Packets: ${this.gpu.totalDrawPacketsProcessed.toLocaleString()} | Frames Rendered: ${this.gpu.framesRendered}`,
@@ -640,7 +944,7 @@ export class Ps1Emulator {
     const output = lines.join('\n');
     console.log(output);
 
-    this.addLog('system', `Status Dump: PC=${pcHex} | VRAM Pixels: ${hasPixels ? `YES (${totalVramNonZero.toLocaleString()})` : 'NO'} | Display: ${displayPixelsExist ? `${displayNonZero.toLocaleString()} px` : '0 px'} | Last Event: ${events.length > 0 ? events[events.length - 1].message : 'None'}`);
+    this.addLog('system', `Status Dump: PC=${pcHex} | GP0=${gp0Count} GP1=${gp1Count} | VBLANK IRQ0=${vblankCount} | VRAM Pixels: ${hasPixels ? `YES (${totalVramNonZero.toLocaleString()})` : 'NO'} | Display: ${displayPixelsExist ? `${displayNonZero.toLocaleString()} px` : '0 px'}`);
 
     return output;
   }
@@ -693,25 +997,7 @@ export class Ps1Emulator {
         this.addLog('system', logMsg, this.cpu.pc);
         this.recordRelevantEvent('DEBUG', logMsg);
       }
-      if (this.postLaunchCycles - this.lastPostLaunchLogCycle >= 100000) {
-        this.lastPostLaunchLogCycle = this.postLaunchCycles;
-        const currentPcHex = `0x${this.cpu.pc.toString(16).padStart(8, '0').toUpperCase()}`;
-        console.log(`[PSX.EXE RUNNING] PC: ${currentPcHex} (+${this.postLaunchCycles.toLocaleString()} cycles post-launch)`);
-      }
     }
-
-    // Silenced per user request: [CPU STALL / KERNEL LOOP]
-    // if (this.cyclesSinceCdromOrDma >= 1000000) {
-    //   if (this.cyclesSinceCdromOrDma - this.lastStallLogCycles >= 1000000) {
-    //     this.lastStallLogCycles = this.cyclesSinceCdromOrDma;
-    //     const pcHex = `0x${this.cpu.pc.toString(16).padStart(8, '0').toUpperCase()}`;
-    //     const iStatHex = `0x${this.memory.iStat.toString(16).padStart(4, '0').toUpperCase()}`;
-    //     const iMaskHex = `0x${this.memory.iMask.toString(16).padStart(4, '0').toUpperCase()}`;
-    //     const stallMsg = `[CPU STALL / KERNEL LOOP] PC: ${pcHex} | I_STAT: ${iStatHex} | I_MASK: ${iMaskHex} | Cycles without CD/DMA: ${this.cyclesSinceCdromOrDma.toLocaleString()}`;
-    //     console.log(stallMsg);
-    //     this.addLog('bios', stallMsg, this.cpu.pc);
-    //   }
-    // }
 
     this.memory.checkDma();
     this.cpu.checkInterrupts();
@@ -723,10 +1009,40 @@ export class Ps1Emulator {
     this.gpu.currentScanline = scanline;
     this.gpu.vblank = scanline >= 240;
 
-    // Periodically assert VBlank IRQ 0 and deliver event 0xF0000001 when frame completes / scanline wraps
+    // Periodically assert VBlank IRQ 0 and deliver event when frame completes / scanline wraps
     if (this.vblankCycleCounter >= Ps1Emulator.NTSC_VBLANK_CYCLES) {
+      this.vblankCycleCounter -= Ps1Emulator.NTSC_VBLANK_CYCLES;
       this.memory.triggerInterrupt(0);
+      this.gpu.onVBlank();
+      this.gpu.vblank = true;
+      this.gpu.currentField ^= 1;
+      if (this.gpu.currentField === 1) {
+        this.gpu.gpuStat |= (1 << 31);
+      } else {
+        this.gpu.gpuStat &= ~(1 << 31);
+      }
+      this.gpu.framesRendered++;
+      this.wallClockFrameCount++;
+
+      // Informative log on initial VBLANK interrupts and periodic sync checkpoints
+      if (this.gpu.framesRendered === 1 || this.gpu.framesRendered === 60 || this.gpu.framesRendered % 600 === 0) {
+        const iStatHex = `0x${(this.memory.iStat & 0xffff).toString(16).padStart(4, '0').toUpperCase()}`;
+        const iMaskHex = `0x${(this.memory.iMask & 0xffff).toString(16).padStart(4, '0').toUpperCase()}`;
+        const srHex = `0x${(this.cpu.cop0Regs[12] >>> 0).toString(16).padStart(8, '0').toUpperCase()}`;
+        const iec = this.cpu.cop0Regs[12] & 1;
+        const vblankMsg = `[VBLANK IRQ 0] Frame #${this.gpu.framesRendered} cycle sync fired (I_STAT: ${iStatHex}, I_MASK: ${iMaskHex}, SR: ${srHex}, IEc=${iec})`;
+        this.addLog('gpu', vblankMsg);
+        this.recordRelevantEvent('VBLANK', vblankMsg);
+      }
+
+      if (this.gpu.onFrame) {
+        this.gpu.onFrame();
+      } else {
+        this.gpu.blitFrame();
+      }
+
       this.cpu.checkInterrupts();
+      this.checkLogoLoopSafetyCap();
     }
   }
 
@@ -827,55 +1143,10 @@ export class Ps1Emulator {
       this.cpu.checkInterrupts();
     }
 
-    this.vblankCycleCounter += executed;
-    this.totalCycles += executed;
     this.memory.flushCycles();
     this.checkExecutableLaunch();
 
-    if (this.vblankCycleCounter >= Ps1Emulator.NTSC_VBLANK_CYCLES) {
-      // 1. Set Bit 0 of I_STAT (0x1F801070 |= 0x01) and update interrupts
-      this.memory.triggerInterrupt(0);
-      this.gpu.onVBlank();
-
-      // 2. Reset the frame cycle counter
-      this.vblankCycleCounter -= Ps1Emulator.NTSC_VBLANK_CYCLES;
-      if (this.vblankCycleCounter >= Ps1Emulator.NTSC_VBLANK_CYCLES) {
-        this.vblankCycleCounter = 0;
-      }
-
-      this.gpu.vblank = true;
-      this.gpu.currentField ^= 1;
-      if (this.gpu.currentField === 1) {
-        this.gpu.gpuStat |= (1 << 19);
-      } else {
-        this.gpu.gpuStat &= ~(1 << 19);
-      }
-      this.gpu.framesRendered++;
-      this.wallClockFrameCount++;
-
-      if (this.gpu.framesRendered % 1000 === 0) {
-        console.log(`[GPU DRAW STATS @ Frame ${this.gpu.framesRendered}] Total GP0 Draw Packets: ${this.gpu.totalDrawPacketsProcessed.toLocaleString()} | Display: ${this.gpu.displayWidth}x${this.gpu.displayHeight} @ VRAM (${this.gpu.displayVramX},${this.gpu.displayVramY}) | DrawOffset: (${this.gpu.drawOffsetX},${this.gpu.drawOffsetY}) | Blanking: ${this.gpu.displayDisabled ? 'BLANKED' : 'ENABLED'}`);
-      }
-
-      // 3. Trigger canvas presentation once per frame during VBLANK (60 Hz)
-      // Force canvas flush at the end of every VBLANK tick so the browser paints the frame
-      if (this.gpu.onFrame) {
-        this.gpu.onFrame();
-      } else {
-        this.gpu.blitFrame();
-      }
-
-      // 4. Evaluate CPU interrupt
-      this.cpu.checkInterrupts();
-
-      // 5. Safety cap check for BIOS logo loop
-      this.checkLogoLoopSafetyCap();
-    }
-
     const tFrame = performance.now() - t0;
-    // if (useJit && (this.gpu.framesRendered % 60 === 0 || this.gpu.framesRendered === 1)) {
-    //   console.log(`[JIT FRAME PROFILER] Frame ${this.gpu.framesRendered}: ${blocksInFrame} blocks executed, ${executed} virtual cycles, host execution time: ${tFrame.toFixed(2)} ms`);
-    // }
     const gpuDrawFrame = this.gpu.totalGpuDrawMs - gpuDrawBefore;
     const blitFrame = this.gpu.totalBlitMs - blitBefore;
     const cpuFrame = Math.max(0, tFrame - gpuDrawFrame - blitFrame);
@@ -978,10 +1249,12 @@ export class Ps1Emulator {
   }
 
   public addLog(type: ConsoleLog['type'], message: string, pc?: number, details?: string): void {
-    if (this.status === 'running' && type === 'disasm') {
-      return;
+    if (this.status === 'running') {
+      if (type === 'disasm' || type === 'bios' || type === 'gpu' || type === 'warn' || type === 'system') {
+        if (!this.cpu.debugLogging) return;
+      }
     }
-    if (this.isLoggingPaused && type !== 'error' && type !== 'system' && type !== 'bios' && type !== 'tty' && type !== 'warn') {
+    if (this.isLoggingPaused && type !== 'error' && type !== 'system' && type !== 'bios' && type !== 'tty' && type !== 'warn' && type !== 'gpu') {
       return;
     }
     const log: ConsoleLog = {
@@ -999,6 +1272,109 @@ export class Ps1Emulator {
 
   public fastForwardSplash(): void {
     this.cpu.fastForwardSplash();
+  }
+
+  /**
+   * Loads and executes a standalone PS-X hardware test binary directly into PS1 memory.
+   */
+  public runTestExecutable(exeBytes: Uint8Array, testName: string = 'HARDWARE TEST'): void {
+    this.pause();
+    this.reset();
+
+    // Parse PS-X EXE header (2048 bytes)
+    const view = new DataView(exeBytes.buffer, exeBytes.byteOffset, Math.min(exeBytes.byteLength, 2048));
+    const initialPc = view.getUint32(0x10, true) || 0x80010000;
+    const initialGp = view.getUint32(0x14, true) || 0x80080000;
+    const loadAddr = view.getUint32(0x18, true) || 0x80010000;
+    const loadSize = view.getUint32(0x1c, true) || (exeBytes.byteLength - 2048);
+    const initialSpBase = view.getUint32(0x30, true) || 0x801f0000;
+    const initialSpOffset = view.getUint32(0x34, true) || 0x0000fff0;
+
+    // Load executable machine code into PS1 Main RAM
+    const ramOffset = loadAddr & 0x001fffff;
+    const codeData = exeBytes.subarray(2048, 2048 + loadSize);
+    this.memory.ram.set(codeData, ramOffset);
+
+    // Initialize CPU Execution Context
+    this.cpu.pc = initialPc >>> 0;
+    this.cpu.nextPc = (initialPc + 4) >>> 0;
+    this.cpu.regs[28] = initialGp >>> 0; // $gp
+    this.cpu.regs[29] = (initialSpBase + initialSpOffset) >>> 0; // $sp
+    this.cpu.regs[30] = (initialSpBase + initialSpOffset) >>> 0; // $fp / $s8
+
+    if (this.cpu.gte) {
+      this.cpu.gte.reset();
+      this.cpu.gte.diagnosticCount = 0;
+    }
+
+    // Initialize GPU Display & Render State
+    this.gpu.reset();
+    this.gpu.displayDisabled = false;
+    this.gpu.displayWidth = 320;
+    this.gpu.displayHeight = 240;
+    this.gpu.drawAreaX1 = 0;
+    this.gpu.drawAreaY1 = 0;
+    this.gpu.drawAreaX2 = 319;
+    this.gpu.drawAreaY2 = 239;
+
+    this.hasLoggedExecutableLaunch = true;
+    this.isFastBoot = false;
+
+    this.addLog('system', `[TEST SUITE] Executing "${testName}" at PC: 0x${initialPc.toString(16).toUpperCase()} (${loadSize} bytes)`);
+    this.recordRelevantEvent('TEST', `Running test "${testName}"`);
+
+    this.start();
+  }
+
+  /**
+   * Runs one of the predefined hardware test suites by ID
+   */
+  public runHardwareTest(testId: string): void {
+    switch (testId) {
+      case 'cdrom_hardware_test': {
+        // Mount synthetic 64-sector disc image for CD-ROM hardware validation
+        const discData = createSyntheticCdromTestDisc();
+        this.cdrom.mountDisc(discData, 'CDROM_SYNTHETIC_TEST_DISC.BIN');
+        this.memory.hasDiscLoaded = true;
+
+        const bin = generateCdromHardwareTest();
+        this.runTestExecutable(bin, 'CD-ROM: Subsystem & DMA 3 Hardware Test');
+        break;
+      }
+      case 'spu_audio_synth': {
+        const bin = generateSpuSynthTest();
+        this.runTestExecutable(bin, 'SPU: 24-Voice Audio & ADPCM Synth Test');
+        break;
+      }
+      case 'gpu_poly_anim': {
+        const bin = generateGpuPolyAnimTest();
+        this.runTestExecutable(bin, 'GPU: 3D Polygon & Animation Test');
+        break;
+      }
+      case 'gte_projection': {
+        const bin = generateGteProjectionTest();
+        this.runTestExecutable(bin, 'GTE: COP2 3D Geometry & Perspective Test');
+        break;
+      }
+      case 'gpu_stress_bench': {
+        const bin = generateGpuStressBenchmark();
+        this.runTestExecutable(bin, 'GPU: Polygon Stress & Fillrate Benchmark');
+        break;
+      }
+      case 'gpu_blend_modes': {
+        const bin = generateBlendModesTest();
+        this.runTestExecutable(bin, 'GPU: Semi-Transparency & Blend Modes');
+        break;
+      }
+      case 'cpu_dma_bench': {
+        const bin = generateCpuDmaBenchmark();
+        this.runTestExecutable(bin, 'CPU / MEM: MIPS & DMA Benchmark');
+        break;
+      }
+      default:
+        this.addLog('warn', `Unknown test suite ID: "${testId}"`);
+        break;
+    }
   }
 
   private notifyState(): void {
